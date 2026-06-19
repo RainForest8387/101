@@ -122,3 +122,47 @@ curl -s "http://localhost:9200/_cat/indices?v&s=index" | grep docker
 - Для `docker_logs` source Vector использует Docker API — сокет `/var/run/docker.sock` должен быть доступен пользователю `vector`
 - Поле `container_name` в событии Vector содержит имя контейнера без `/`
 - Если контейнеры пишут структурированный JSON в stdout — `parse_json` распакует поля на верхний уровень, что удобно для поиска в Kibana
+
+
+## Установка musl-архива на Astra
+Astra основана на Debian, так что установка из tar — стандартная:
+```bash
+# распаковка (структура архива: bin/vector, config/...)
+mkdir -p /tmp/vector && tar xzf vector-0.55.0-x86_64-unknown-linux-musl.tar.gz -C /tmp/vector --strip-components=2
+
+# бинарник на место
+sudo install -m755 /tmp/vector/bin/vector /usr/local/bin/vector
+/usr/local/bin/vector --version   # должно напечатать версию без ошибки GLIBC
+
+# системный пользователь, доступ к docker-сокету, каталоги
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin vector 2>/dev/null
+sudo usermod -aG docker vector
+sudo mkdir -p /etc/vector /var/lib/vector
+sudo chown -R vector:vector /var/lib/vector
+# положите свой конфиг в /etc/vector/vector.yaml
+```
+
+systemd-юнит /etc/systemd/system/vector.service:
+```bash
+[Unit]
+Description=Vector
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=vector
+Group=vector
+ExecStartPre=/usr/local/bin/vector validate /etc/vector/vector.yaml
+ExecStart=/usr/local/bin/vector --config /etc/vector/vector.yaml
+Restart=always
+Environment=VECTOR_DATA_DIR=/var/lib/vector
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now vector
+sudo journalctl -u vector -f
+```
