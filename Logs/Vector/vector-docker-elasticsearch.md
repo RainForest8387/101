@@ -161,6 +161,48 @@ Environment=VECTOR_DATA_DIR=/var/lib/vector
 WantedBy=multi-user.target
 ```
 
+Добавление конфига
+```bash
+sudo mkdir -p /etc/vector
+sudo tee /etc/vector/vector.yaml > /dev/null <<'EOF'
+sources:
+  docker_logs:
+    type: docker_logs
+    docker_host: unix:///var/run/docker.sock
+    # include_containers: ["my-app", "nginx"]
+    # exclude_containers: ["vector"]
+
+transforms:
+  parse:
+    type: remap
+    inputs: ["docker_logs"]
+    source: |
+      structured, err = parse_json(.message)
+      if err == null {
+        . = merge(., structured)
+      }
+
+sinks:
+  elasticsearch:
+    type: elasticsearch
+    inputs: ["parse"]
+    endpoints: ["http://elasticsearch:9200"]   # замените на адрес вашего ES
+    api_version: auto
+    mode: bulk
+    bulk:
+      index: "docker-logs-%Y.%m.%d"
+      action: create
+    compression: none
+    healthcheck:
+      enabled: true
+    # auth:
+    #   strategy: basic
+    #   user: "elastic"
+    #   password: "${ELASTIC_PASSWORD}"
+EOF
+```
+
+
 ```
 sudo systemctl daemon-reload
 sudo systemctl enable --now vector
