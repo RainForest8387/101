@@ -1,0 +1,200 @@
+<#
+.SYNOPSIS
+    Проверяет доступность SSH (порт 22 или указанный) на списке хостов.
+
+.DESCRIPTION
+    Скрипт проходит по списку хостов (из файла или переданному массиву) и:
+      1. Проверяет TCP-доступность порта SSH (по умолчанию 22).
+      2. Если установлен модуль Posh-SSH и переданы учётные данные —
+         пытается выполнить полноценное SSH-подключение и авторизацию.
+    Результаты выводятся на экран и сохраняются в CSV-файл.
+
+.PARAMETER HostsFile
+    Путь к текстовому файлу со списком хостов (по одному хосту в строке).
+
+.PARAMETER HostList
+    Массив хостов, переданный напрямую в параметр.
+
+.PARAMETER Port
+    Порт SSH. По умолчанию 22.
+
+.PARAMETER TimeoutSeconds
+    Таймаут ожидания ответа порта в секундах. По умолчанию 5.
+
+.PARAMETER Credential
+    Учётные данные для реальной проверки SSH-логина (требует модуль Posh-SSH).
+    Если не указаны — выполняется только проверка доступности порта.
+
+.PARAMETER OutputCsv
+    Путь для сохранения результата в CSV. По умолчанию .\ssh_check_results.csv
+
+.EXAMPLE
+    .\Test-SshConnection.ps1 -HostsFile .\hosts.txt
+
+.EXAMPLE
+    .\Test-SshConnection.ps1 -HostList "10.0.0.1","server2.local" -Port 2222
+
+.EXAMPLE
+    $cred = Get-Credential
+    .\Test-SshConnection.ps1 -HostsFile .\hosts.txt -Credential $cred
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'FromFile')]
+param(
+    [Parameter(ParameterSetName = 'FromFile', Mandatory = $true)]
+    [string]$HostsFile,
+
+    [Parameter(ParameterSetName = 'FromList', Mandatory = $true)]
+    [string[]]$HostList,
+
+    [int]$Port = 22,
+
+    [int]$TimeoutSeconds = 5,
+
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [string]$OutputCsv = ".\ssh_check_results.csv"
+)
+
+# ---------------------------------------------------------------------------
+# 1. Формируем список хостов
+# ---------------------------------------------------------------------------
+if ($PSCmdlet.ParameterSetName -eq 'FromFile') {
+    if (-not (Test-Path -LiteralPath $HostsFile)) {
+        Write-Error "Файл со списком хостов не найден: $HostsFile"
+        return
+    }
+    $targets = Get-Content -LiteralPath $HostsFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
+}
+else {
+    $targets = $HostList
+}
+
+if (-not $targets -or $targets.Count -eq 0) {
+    Write-Error "Список хостов пуст."
+    return
+}
+
+# ---------------------------------------------------------------------------
+# 2. Проверяем наличие модуля Posh-SSH для полноценной проверки логина
+# ---------------------------------------------------------------------------
+$poshSshAvailable = $false
+if ($Credential) {
+    if (-not (Get-Module -ListAvailable -Name Posh-SSH)) {
+        Write-Warning "Модуль Posh-SSH не найден. Будет выполнена только проверка TCP-порта."
+        Write-Warning "Установить можно командой: Install-Module -Name Posh-SSH -Scope CurrentUser"
+    }
+    else {
+        Import-Module Posh-SSH -ErrorAction SilentlyContinue
+        $poshSshAvailable = $true
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Функция проверки одного хоста
+# ---------------------------------------------------------------------------
+function Test-SingleHost {
+    param(
+        [string]$TargetHost,
+        [int]$TargetPort,
+        [int]$Timeout,
+        [System.Management.Automation.PSCredential]$Cred,
+        [bool]$UsePoshSsh
+    )
+
+    $result = [PSCustomObject]@{
+        Host          = $TargetHost
+        Port          = $TargetPort
+        PortOpen      = $false
+        SshAuthOk     = $null
+        Latency_ms    = $null
+        Status        = ''
+        Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        ErrorMessage  = ''
+    }
+
+    # --- Проверка TCP-порта ---
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $connectTask = $tcp.ConnectAsync($TargetHost, $TargetPort)
+        $completed = $connectTask.Wait([TimeSpan]::FromSeconds($Timeout))
+        $sw.Stop()
+
+        if ($completed -and $tcp.Connected) {
+            $result.PortOpen   = $true
+            $result.Latency_ms = $sw.ElapsedMilliseconds
+            $result.Status     = 'Порт открыт'
+        }
+        else {
+            $result.Status       = 'Таймаут / порт закрыт'
+            $result.ErrorMessage = "Не удалось подключиться за $Timeout сек."
+        }
+        $tcp.Close()
+    }
+    catch {
+        $result.Status       = 'Ошибка подключения'
+        $result.ErrorMessage = $_.Exception.Message
+    }
+
+    # --- Реальная проверка SSH-логина (если порт открыт и есть Posh-SSH) ---
+    if ($result.PortOpen -and $UsePoshSsh -and $Cred) {
+        try {
+            $session = New-SSHSession -ComputerName $TargetHost -Port $TargetPort `
+                -Credential $Cred -AcceptKey -ConnectionTimeout $Timeout -ErrorAction Stop
+            if ($session) {
+                $result.SshAuthOk = $true
+                $result.Status    = 'SSH-логин успешен'
+                Remove-SSHSession -SessionId $session.SessionId | Out-Null
+            }
+        }
+        catch {
+            $result.SshAuthOk    = $false
+            $result.Status       = 'Порт открыт, SSH-логин не прошёл'
+            $result.ErrorMessage = $_.Exception.Message
+        }
+    }
+
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# 4. Прогон по всем хостам
+# ---------------------------------------------------------------------------
+$results = @()
+$i = 0
+foreach ($h in $targets) {
+    $i++
+    Write-Progress -Activity "Проверка SSH" -Status "$h ($i из $($targets.Count))" `
+        -PercentComplete (($i / $targets.Count) * 100)
+
+    $r = Test-SingleHost -TargetHost $h -TargetPort $Port -Timeout $TimeoutSeconds `
+        -Cred $Credential -UsePoshSsh $poshSshAvailable
+    $results += $r
+}
+Write-Progress -Activity "Проверка SSH" -Completed
+
+# ---------------------------------------------------------------------------
+# 5. Вывод результатов
+# ---------------------------------------------------------------------------
+$results | Format-Table -AutoSize Host, Port, PortOpen, SshAuthOk, Latency_ms, Status
+
+$okCount   = ($results | Where-Object { $_.PortOpen }).Count
+$failCount = $results.Count - $okCount
+Write-Host ""
+Write-Host "Итого: $($results.Count) хостов | доступно: $okCount | недоступно: $failCount" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# 6. Сохранение в CSV
+# ---------------------------------------------------------------------------
+try {
+    $results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "Результаты сохранены в: $OutputCsv" -ForegroundColor Green
+}
+catch {
+    Write-Warning "Не удалось сохранить CSV: $($_.Exception.Message)"
+}
+
+return $results
