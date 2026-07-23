@@ -221,20 +221,6 @@ ensure_ntpdate() {
   return 1
 }
 
-# Определение внешнего (белого) IP, как его видит сеть/оператор СМЭВ.
-# Пробуем несколько независимых сервисов; печатает IP или пусто.
-get_external_ip() {
-  local svc ip
-  for svc in "https://ifconfig.me/ip" "https://api.ipify.org" \
-             "https://ipinfo.io/ip" "https://icanhazip.com" "https://ident.me"; do
-    ip=$(curl -s --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      printf '%s' "$ip"; return 0
-    fi
-  done
-  return 1
-}
-
 # Локальный IP интерфейса, через который идёт маршрут к сети СМЭВ.
 get_local_ip() {  # target
   local target="$1" ip=""
@@ -287,15 +273,9 @@ emit "############################################################"
 
 # --- Сведения о клиенте (для заявок оператору СМЭВ) ---
 LOCAL_IP=$(get_local_ip "${BROKERS[0]%%:*}")
-EXT_IP=$(get_external_ip) || EXT_IP=""
 emit ""
 emit "${C_HDR}===== Адреса этого хоста =====${C_RST}"
 emit "  Локальный IP (маршрут к СМЭВ): ${LOCAL_IP:-не определён}"
-if [[ -n "$EXT_IP" ]]; then
-  emit "  Внешний (белый) IP:            $EXT_IP"
-else
-  emit "  Внешний (белый) IP:            ${C_DIM}не определён (нет доступа в интернет или сервис недоступен)${C_RST}"
-fi
 
 # --- Брокеры ---
 emit ""
