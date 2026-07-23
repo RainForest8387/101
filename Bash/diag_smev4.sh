@@ -242,6 +242,25 @@ check_ntp() {  # host
   if bin=$(find_bin nc); then
     printf '\x1b%.0s' {1..48} | "$bin" -u -w "$TIMEOUT" "$host" 123 2>/dev/null | grep -q . && return 0
   fi
+  # Запасной вариант без внешних пакетов: NTP-запрос на чистом python3.
+  if bin=$(find_bin python3); then
+    "$bin" - "$host" "$TIMEOUT" <<'PY' >/dev/null 2>&1
+import socket, sys, struct
+host, timeout = sys.argv[1], float(sys.argv[2])
+pkt = b'\x1b' + 47*b'\0'          # NTP client request (LI=0,VN=3,Mode=3)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(timeout)
+try:
+    s.sendto(pkt, (host, 123))
+    data, _ = s.recvfrom(48)
+    sys.exit(0 if len(data) >= 48 else 1)   # 0 = получен корректный ответ
+except Exception:
+    sys.exit(1)                              # 1 = нет ответа/таймаут
+PY
+    rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    return 1
+  fi
   return 2
 }
 
