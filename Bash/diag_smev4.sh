@@ -8,7 +8,7 @@
 #        - auth     -> HTTPS-запрос (по доменному имени, как требует конфиг);
 #        - NTP      -> UDP/NTP-проба.
 #   2) Трассировка (traceroute/mtr) запускается ТОЛЬКО для недоступных адресов,
-#      проба идёт на порт/протокол, который не ответил:
+#      проба идёт на тот же порт/протокол, который не ответил:
 #        - брокер   -> TCP-SYN на его уникальный порт;
 #        - auth     -> TCP-SYN на 443;
 #        - NTP      -> ICMP.
@@ -23,9 +23,12 @@
 #   ./diag_smev4.sh -t 3             # таймаут проверки (сек), по умолч. 5
 #   ./diag_smev4.sh -m 30            # макс. хопов трассировки
 #   ./diag_smev4.sh --no-color       # без цвета
+#   ./diag_smev4.sh --no-install     # не доустанавливать ntpdate автоматически
 #   ./diag_smev4.sh -o report.txt    # сохранить полный отчёт в файл
 #
-# Для TCP/ICMP-трассировки нужны права root
+# Если ntpdate не установлен, скрипт попытается установить его автоматически
+# (apt/dnf/yum/zypper/pacman, при необходимости через sudo).
+# Для TCP/ICMP-трассировки и автоустановки пакетов нужны права root
 # Код возврата: 0 — всё доступно; 1 — есть недоступные адреса.
 
 set -u
@@ -35,6 +38,7 @@ MAXHOPS=30
 TRACE_MODE="failed"   # failed | all | none
 USE_COLOR=1
 OUTFILE=""
+NO_INSTALL=0          # 1 = не пытаться доустанавливать ntpdate
 
 # ---------- разбор аргументов ----------
 while [[ $# -gt 0 ]]; do
@@ -44,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --trace-all)  TRACE_MODE="all"; shift ;;
     --no-trace)   TRACE_MODE="none"; shift ;;
     --no-color)   USE_COLOR=0; shift ;;
+    --no-install) NO_INSTALL=1; shift ;;
     -o|--output)  OUTFILE="$2"; shift 2 ;;
     -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
@@ -120,9 +125,12 @@ if [[ "$TRACE_MODE" != "none" && $EUID -ne 0 ]]; then
 fi
 
 # ---------- вывод ----------
+# На экран — как есть (с цветом), в файл — со снятыми ANSI-кодами.
 emit() {
-  if [[ -n "$OUTFILE" ]]; then printf '%s\n' "$*" | tee -a "$OUTFILE"
-  else printf '%s\n' "$*"; fi
+  printf '%s\n' "$*"
+  if [[ -n "$OUTFILE" ]]; then
+    printf '%s\n' "$*" | sed -E $'s/\033\\[[0-9;]*m//g' >> "$OUTFILE"
+  fi
 }
 
 # ---------- проверки доступности ----------
@@ -140,6 +148,65 @@ check_https() {  # url
          --connect-timeout "$TIMEOUT" --max-time $((TIMEOUT*3)) "$1" 2>/dev/null)
   [[ -n "$code" && "$code" != "000" ]]
 }
+resolve_host() {  # host -> печатает IP в stdout, код 0 если удалось
+  local host="$1" ip=""
+  if command -v getent >/dev/null 2>&1; then
+    ip=$(getent ahosts "$host" 2>/dev/null | awk '/STREAM|RAW|DGRAM/{print $1; exit} {print $1; exit}')
+  fi
+  if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+    ip=$(host "$host" 2>/dev/null | awk '/has address/{print $NF; exit}')
+  fi
+  if [[ -z "$ip" ]] && command -v nslookup >/dev/null 2>&1; then
+    ip=$(nslookup "$host" 2>/dev/null | awk '/^Address: /{print $2; exit}')
+  fi
+  if [[ -z "$ip" ]] && command -v python3 >/dev/null 2>&1; then
+    ip=$(python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$host" 2>/dev/null)
+  fi
+  [[ -n "$ip" ]] && { printf '%s' "$ip"; return 0; } || return 1
+}
+
+# Проверка наличия ntpdate; при отсутствии — попытка автоустановки.
+# Возвращает 0, если ntpdate доступен после проверки/установки.
+ensure_ntpdate() {
+  command -v ntpdate >/dev/null 2>&1 && return 0
+  [[ "$NO_INSTALL" -eq 1 ]] && return 1
+
+  # Определяем менеджер пакетов
+  local pm="" install=""
+  if   command -v apt-get >/dev/null 2>&1; then pm="apt-get"; install="apt-get install -y ntpdate"
+  elif command -v apt     >/dev/null 2>&1; then pm="apt";     install="apt install -y ntpdate"
+  elif command -v dnf     >/dev/null 2>&1; then pm="dnf";     install="dnf install -y ntpdate"
+  elif command -v yum     >/dev/null 2>&1; then pm="yum";     install="yum install -y ntpdate"
+  elif command -v zypper  >/dev/null 2>&1; then pm="zypper";  install="zypper --non-interactive install ntpdate"
+  elif command -v pacman  >/dev/null 2>&1; then pm="pacman";  install="pacman -Sy --noconfirm ntp"
+  else
+    emit "  ${C_DIM}ntpdate не найден, менеджер пакетов не определён — установка невозможна.${C_RST}"
+    return 1
+  fi
+
+  # Нужны права root
+  local sudo_cmd=""
+  if [[ $EUID -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then sudo_cmd="sudo"
+    else
+      emit "  ${C_DIM}ntpdate не установлен; нет прав root для установки ($pm). Запустите под root или: $install${C_RST}"
+      return 1
+    fi
+  fi
+
+  emit "  ${C_DIM}ntpdate не найден — устанавливаю пакет ($pm)...${C_RST}"
+  # Для apt обновим индексы (тихо), ошибки не критичны
+  if [[ "$pm" == "apt" || "$pm" == "apt-get" ]]; then
+    $sudo_cmd $pm update >/dev/null 2>&1
+  fi
+  if $sudo_cmd $install >/dev/null 2>&1 && command -v ntpdate >/dev/null 2>&1; then
+    emit "  ${C_DIM}ntpdate успешно установлен.${C_RST}"
+    return 0
+  fi
+  emit "  ${C_DIM}Не удалось установить ntpdate автоматически. Установите вручную: $install${C_RST}"
+  return 1
+}
+
 check_ntp() {  # host
   local host="$1"
   if command -v ntpdate >/dev/null 2>&1; then
@@ -197,15 +264,21 @@ done
 
 # --- Auth ---
 emit ""
-emit "${C_HDR}===== Серверы аутентификации (HTTPS, по доменному имени) =====${C_RST}"
+emit "${C_HDR}===== Серверы аутентификации (HTTPS, по fqdn) =====${C_RST}"
 for url in "${AUTH_URLS[@]}"; do
   # хост из URL для трассировки
   hostport="${url#https://}"; hostport="${hostport%%/*}"; ahost="${hostport%%:*}"
+  # предварительная проверка DNS: без резолва нет смысла в HTTPS/трассировке
+  if ! aip=$(resolve_host "$ahost"); then
+    emit "  [${C_FAIL}DNS FAIL${C_RST}] $url  ${C_DIM}(имя не резолвиться в IP — ошибка DNS)${C_RST}"
+    ((FAIL++))
+    continue
+  fi
   if check_https "$url"; then
-    emit "  [$OK_MARK]   $url"; ((PASS++))
+    emit "  [$OK_MARK]   $url  ${C_DIM}($ahost -> $aip)${C_RST}"; ((PASS++))
     [[ "$TRACE_MODE" == "all" ]] && do_trace "$ahost" tcp 443
   else
-    emit "  [$FAIL_MARK] $url"; ((FAIL++))
+    emit "  [$FAIL_MARK] $url  ${C_DIM}($ahost -> $aip)${C_RST}"; ((FAIL++))
     [[ "$TRACE_MODE" != "none" ]] && do_trace "$ahost" tcp 443
   fi
 done
@@ -213,6 +286,7 @@ done
 # --- NTP ---
 emit ""
 emit "${C_HDR}===== NTP-серверы (UDP 123) =====${C_RST}"
+ensure_ntpdate   # проверить/доустановить ntpdate перед проверкой
 for host in "${NTP_HOSTS[@]}"; do
   check_ntp "$host"; rc=$?
   if [[ $rc -eq 0 ]]; then
