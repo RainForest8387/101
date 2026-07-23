@@ -11,7 +11,7 @@
 #      проба идёт на тот же порт/протокол, который не ответил:
 #        - брокер   -> TCP-SYN на его уникальный порт;
 #        - auth     -> TCP-SYN на 443;
-#        - NTP      -> ICMP.
+#        - NTP      -> UDP на порт 123.
 #
 # Каждый брокер имеет собственный порт — проверяется и трассируется
 # именно пара host:port (109.207.15.27:6651 и 109.207.15.27:6652 — отдельно).
@@ -340,12 +340,12 @@ for host in "${NTP_HOSTS[@]}"; do
   check_ntp "$host"; rc=$?
   if [[ $rc -eq 0 ]]; then
     emit "  [$OK_MARK]   $host"; ((PASS++))
-    [[ "$TRACE_MODE" == "all" ]] && do_trace "$host" icmp ""
+    [[ "$TRACE_MODE" == "all" ]] && do_trace "$host" udp 123
   elif [[ $rc -eq 2 ]]; then
     emit "  [SKIP] $host (нет ntpdate/sntp/nc для проверки)"
   else
     emit "  [$FAIL_MARK] $host"; ((FAIL++))
-    [[ "$TRACE_MODE" != "none" ]] && do_trace "$host" icmp ""
+    [[ "$TRACE_MODE" != "none" ]] && do_trace "$host" udp 123
   fi
 done
 
