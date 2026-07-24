@@ -79,6 +79,9 @@ PASS=0; FAIL=0
 # ---------- конфигурация ----------
 # Брокеры: "host:port  описание"
 BROKERS=(
+  # 1 DC
+  "172.20.65.5:6651    DC One NODE1 broker"
+  "172.20.65.5:6652    DC One NODE1 broker"
   # NODE1 broker-addresses
   "109.207.15.27:6651  NODE1 broker"
   "109.207.15.27:6652  NODE1 broker"
@@ -103,18 +106,20 @@ BROKERS=(
 
 # Серверы аутентификации (только по доменному имени!)
 AUTH_URLS=(
+  # 1 DC
+  "https://podd.gosuslugi.ru:443/auth"
+  # 2 DC
   "https://podd1.gosuslugi.ru:443/auth"
   "https://podd2.gosuslugi.ru:443/auth"
   "https://podd3-cross.gosuslugi.ru:443/auth"
   "https://podd4-cross.gosuslugi.ru:443/auth"
-  "https://podd3.gosuslugi.ru:443/auth"
-  "https://podd4.gosuslugi.ru:443/auth"
-  "https://podd1-cross.gosuslugi.ru:443/auth"
-  "https://podd2-cross.gosuslugi.ru:443/auth"
 )
 
 # NTP-серверы (UDP 123)
 NTP_HOSTS=(
+   # 1 DC
+   "172.20.65.5"
+   # 2 DC
   "109.207.15.28"
   "109.207.15.60"
   "109.207.15.156"
