@@ -6,7 +6,8 @@
 #   1. Находит топики, имя которых целиком соответствует ERE-паттерну (напр. 'drub.*').
 #   2. Для каждого топика проверяет, что он ПУСТ (0 сообщений во всех партициях).
 #   3. Пустые — удаляет и создаёт заново с заданным числом партиций.
-#   4. Непустые — ПРОПУСКАЕТ с предупреждением (защита от потери данных).
+#   4. Непустые — по умолчанию ПРОПУСКАЕТ (защита от потери данных);
+#      с флагом --force — тоже удаляет и пересоздаёт (ДАННЫЕ БУДУТ ПОТЕРЯНЫ).
 #
 # Уменьшить число партиций (6 -> 1) штатным alter нельзя — только delete + create,
 # поэтому топик обязан быть пустым.
@@ -21,6 +22,7 @@
 #   ./repartition_topics.sh -p 'drub.*' -r 3 -y          # RF=3, без подтверждения
 #   RETENTION_MS=604800000 CLEANUP_POLICY=delete ./repartition_topics.sh -p 'drub.*'
 #   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact
+#   ./repartition_topics.sh -p 'drub.*' --force            # пересоздать ДАЖЕ непустые (потеря данных)
 #
 # Параметры:
 #   -p, --pattern PAT           ERE-паттерн имени топика (обязателен). Матчится целиком: ^PAT$
@@ -30,6 +32,7 @@
 #                               cleanup.policy, retention.bytes, segment.ms, ... (иначе дефолт брокера)
 #   -b, --bootstrap-server HP   адрес брокера host:port (или env BOOTSTRAP)
 #   -c, --command-config FILE   client.properties c SASL/SSL (или env CFG)
+#   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных); env FORCE=1
 #   -n, --dry-run               ничего не менять, только показать, что будет сделано
 #   -y, --yes                   не спрашивать подтверждение
 #       --no-color              без цветного вывода
@@ -65,6 +68,7 @@ BOOTSTRAP="${BOOTSTRAP:-localhost:9092}"
 CFG="${CFG:-}"
 DRY_RUN=0
 ASSUME_YES=0
+FORCE="${FORCE:-0}"     # 1 — пересоздавать даже непустые топики (потеря данных)
 USE_COLOR=1
 DELETE_WAIT=60          # сколько секунд ждать фактического удаления топика
 RAW_CONFIGS=()         # значения флагов -C/--config (обрабатываются после определения хелперов)
@@ -78,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     -C|--config)              RAW_CONFIGS+=("$2"); shift 2 ;;
     -b|--bootstrap-server)    BOOTSTRAP="$2"; shift 2 ;;
     -c|--command-config)      CFG="$2"; shift 2 ;;
+    -f|--force)               FORCE=1; shift ;;
     -n|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
     --no-color)               USE_COLOR=0; shift ;;
@@ -267,13 +272,25 @@ for t in "${MATCHED[@]}"; do info "- $t"; done
 info "Целевые партиции: $PARTITIONS${REPL_FACTOR:+   RF: $REPL_FACTOR}"
 [[ -n "$CONFIG_SUMMARY" ]] && info "Конфиги нового топика: ${CONFIG_SUMMARY% }" \
                           || info "Конфиги нового топика: (дефолты брокера)"
+if [[ "$FORCE" -eq 1 ]]; then
+  info "Непустые топики: ПЕРЕСОЗДАВАТЬ (--force — данные будут потеряны)"
+else
+  info "Непустые топики: пропускать (безопасный режим)"
+fi
 
 # ---------- 2. подтверждение ----------
 if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 0 ]]; then
-  printf '\n%sБудут удалены и пересозданы ПУСТЫЕ топики выше (партиций: %s%s).%s\n' \
-    "$C_WARN" "$PARTITIONS" "${REPL_FACTOR:+, RF: $REPL_FACTOR}" "$C_RST"
-  read -r -p "Продолжить? [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { echo "Отменено."; exit 0; }
+  if [[ "$FORCE" -eq 1 ]]; then
+    printf '\n%sВНИМАНИЕ: режим --force — НЕПУСТЫЕ топики будут удалены ВМЕСТЕ С ДАННЫМИ%s\n' "$C_BAD" "$C_RST"
+    printf '%s(партиций: %s%s). Отмена невозможна.%s\n' "$C_BAD" "$PARTITIONS" "${REPL_FACTOR:+, RF: $REPL_FACTOR}" "$C_RST"
+    read -r -p "Для подтверждения введите слово yes: " ans
+    [[ "$ans" == "yes" ]] || { echo "Отменено."; exit 0; }
+  else
+    printf '\n%sБудут удалены и пересозданы ПУСТЫЕ топики выше (партиций: %s%s).%s\n' \
+      "$C_WARN" "$PARTITIONS" "${REPL_FACTOR:+, RF: $REPL_FACTOR}" "$C_RST"
+    read -r -p "Продолжить? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Отменено."; exit 0; }
+  fi
 fi
 
 # ---------- 3. обработка ----------
@@ -292,10 +309,15 @@ for topic in "${MATCHED[@]}"; do
   fi
 
   if [[ "$cnt" -ne 0 ]]; then
-    warn "Топик НЕ пуст: $cnt сообщ. — пропуск (данные не трогаем)."
-    SKIPPED=$((SKIPPED+1)); continue
+    if [[ "$FORCE" -eq 1 ]]; then
+      warn "Топик НЕ пуст: $cnt сообщ. — режим --force: данные будут УДАЛЕНЫ."
+    else
+      warn "Топик НЕ пуст: $cnt сообщ. — пропуск (для пересоздания используйте --force)."
+      SKIPPED=$((SKIPPED+1)); continue
+    fi
+  else
+    ok "Топик пуст (0 сообщений)."
   fi
-  ok "Топик пуст (0 сообщений)."
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     info "[dry-run] удалил бы и пересоздал '$topic' с $PARTITIONS партициями${CONFIG_SUMMARY:+, конфиги: ${CONFIG_SUMMARY% }}."
