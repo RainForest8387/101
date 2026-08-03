@@ -18,7 +18,7 @@
 # Использование:
 #   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*'   # -> 1 партиция
 #   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1
-#   ./repartition_topics.sh -p 'drub.*' -n               # dry-run: только показать план
+#   ./repartition_topics.sh -p 'drub.*' -d               # dry-run: только показать план
 #   ./repartition_topics.sh -p 'drub.*' -r 3 -y          # RF=3, без подтверждения
 #   RETENTION_MS=604800000 CLEANUP_POLICY=delete ./repartition_topics.sh -p 'drub.*'
 #   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact
@@ -33,7 +33,7 @@
 #   -b, --bootstrap-server HP   адрес брокера host:port (или env BOOTSTRAP)
 #   -c, --command-config FILE   client.properties c SASL/SSL (или env CFG)
 #   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных); env FORCE=1
-#   -n, --dry-run               ничего не менять, только показать, что будет сделано
+#   -d, --dry-run               ничего не менять, только показать, что будет сделано
 #   -y, --yes                   не спрашивать подтверждение
 #       --no-color              без цветного вывода
 #   -h, --help                  эта справка
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
     -b|--bootstrap-server)    BOOTSTRAP="$2"; shift 2 ;;
     -c|--command-config)      CFG="$2"; shift 2 ;;
     -f|--force)               FORCE=1; shift ;;
-    -n|--dry-run)             DRY_RUN=1; shift ;;
+    -d|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
     --no-color)               USE_COLOR=0; shift ;;
     -h|--help)                grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
