@@ -3,13 +3,13 @@
 # repartition_topics.sh — пересоздание Kafka-топиков по паттерну с новым числом партиций.
 #
 # Что делает:
-#   1. Находит топики, имя которых целиком соответствует ERE-паттерну (напр. 'drub.*').
-#   2. Для каждого топика проверяет, что он ПУСТ (0 сообщений во всех партициях).
+#   1. Находит топики, имя которых целиком соответствует паттерну (напр. 'drub.*').
+#   2. Для каждого топика проверяет, что он пустой (0 сообщений во всех партициях).
 #   3. Пустые — удаляет и создаёт заново с заданным числом партиций.
-#   4. Непустые — по умолчанию ПРОПУСКАЕТ (защита от потери данных);
-#      с флагом --force — тоже удаляет и пересоздаёт (ДАННЫЕ БУДУТ ПОТЕРЯНЫ).
+#   4. Непустые — по умолчанию пропускает (защита от потери данных);
+#      с флагом --force — удаляет и непустые и пустые и пересоздаёт (ДАННЫЕ БУДУТ ПОТЕРЯНЫ!).
 #
-# Уменьшить число партиций (6 -> 1) штатным alter нельзя — только delete + create,
+# Уменьшить число партиций штатным alter нельзя — только delete + create,
 # поэтому топик обязан быть пустым.
 #
 # Подключение к брокеру: SASL_SSL / SCRAM-SHA-256 (готовый -c client.properties
@@ -20,17 +20,16 @@
 #   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1
 #   ./repartition_topics.sh -p 'drub.*' -d               # dry-run: только показать план
 #   ./repartition_topics.sh -p 'drub.*' -r 3 -y          # RF=3, без подтверждения
-#   RETENTION_MS=604800000 CLEANUP_POLICY=delete ./repartition_topics.sh -p 'drub.*'
-#   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact
-#   ./repartition_topics.sh -p 'drub.*' --force            # пересоздать ДАЖЕ непустые (потеря данных)
+#   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact # если требуется задать недефлтные параметры топиков
+#   ./repartition_topics.sh -p 'drub.*' --force            # пересоздать даже непустые топки (потеря данных)
 #
 # Параметры:
 #   -p, --pattern PAT           ERE-паттерн имени топика (обязателен). Матчится целиком: ^PAT$
 #   -N, --partitions N          новое число партиций (по умолчанию 1)
 #   -r, --replication-factor N  RF нового топика (по умолчанию — дефолт брокера)
 #   -C, --config KEY=VALUE      конфиг нового топика (можно повторять): retention.ms,
-#                               cleanup.policy, retention.bytes, segment.ms, ... (иначе дефолт брокера)
-#   -b, --bootstrap-server HP   адрес брокера host:port (или env BOOTSTRAP)
+#                               cleanup.policy, retention.bytes, segment.ms, ... (иначе дефолтное значение брокера)
+#   -b, --bootstrap-server      адрес брокера host:port (или env BOOTSTRAP)
 #   -c, --command-config FILE   client.properties c SASL/SSL (или env CFG)
 #   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных); env FORCE=1
 #   -d, --dry-run               ничего не менять, только показать, что будет сделано
@@ -41,7 +40,7 @@
 # Переменные окружения (подключение по SASL_SSL / SCRAM-SHA-256):
 #   BOOTSTRAP                   = адрес брокера host:port, если не задан -b
 #   CFG                         = путь к готовому client.properties, если не задан -c
-#   KAFKA_USER, KAFKA_PASSWORD  = учётка SCRAM; если -c/CFG не заданы, из них генерируется
+#   KAFKA_USER, KAFKA_PASSWORD  = учётка SCRAM; если -c/CFG не заданы, генерируется
 #                                 временный client.properties (security.protocol=SASL_SSL,
 #                                 sasl.mechanism=SCRAM-SHA-256)
 #   SSL_TRUSTSTORE_LOCATION     = truststore c CA брокера (иначе — системный CA JVM)
@@ -53,8 +52,8 @@
 # Конфиги пересоздаваемых топиков (всё необязательно, приоритет: -C > TOPIC_CONFIGS > именованные):
 #   RETENTION_MS, RETENTION_BYTES, CLEANUP_POLICY, SEGMENT_MS, SEGMENT_BYTES,
 #   MIN_INSYNC_REPLICAS, MAX_MESSAGE_BYTES, COMPRESSION_TYPE  — именованные переменные
-#   TOPIC_CONFIGS = "retention.ms=... cleanup.policy=..."     — произвольный список k=v через пробел
-#   (для любых ключей, которых нет среди именованных, используйте -C key=value или TOPIC_CONFIGS)
+#   TOPIC_CONFIGS = "retention.ms=... cleanup.policy=..."     — произвольный список key=value через пробел
+#   (для любых ключей, которых нет среди именованных, использовать -C key=value или TOPIC_CONFIGS)
 #
 # Код возврата: 0 — успех (или нечего делать); 1 — были ошибки/пропуски непустых топиков.
 
