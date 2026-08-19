@@ -9,6 +9,12 @@
 #   4. Непустые — по умолчанию пропускает (защита от потери данных);
 #      с флагом --force — удаляет и непустые и пустые и пересоздаёт (ДАННЫЕ БУДУТ ПОТЕРЯНЫ!).
 #
+# ВАЖНО: по умолчанию скрипт работает в режиме DRY-RUN — только показывает план и
+# ничего не меняет. Чтобы реально удалить и пересоздать топики, нужен флаг --apply.
+#
+# Ход выполнения дублируется в файл отчёта report_<ГГГГ-ММ-ДД>_<ЧЧ-ММ-СС>.log
+# в текущем каталоге (путь меняется через --report / env REPORT_DIR, отключается --no-report).
+#
 # Уменьшить число партиций штатным alter нельзя — только delete + create,
 # поэтому топик обязан быть пустым.
 #
@@ -16,12 +22,12 @@
 # либо генерация временного конфига из KAFKA_USER/KAFKA_PASSWORD — см. ниже).
 #
 # Использование:
-#   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*'   # -> 1 партиция
-#   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1
-#   ./repartition_topics.sh -p 'drub.*' -d               # dry-run: только показать план
-#   ./repartition_topics.sh -p 'drub.*' -r 3 -y          # RF=3, без подтверждения
-#   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact # если требуется задать недефлтные параметры топиков
-#   ./repartition_topics.sh -p 'drub.*' --force            # пересоздать даже непустые топки (потеря данных)
+#   ./repartition_topics.sh -p 'drub.*'                  # dry-run (по умолчанию): только план
+#   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*' --apply   # -> 1 партиция
+#   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1 --apply
+#   ./repartition_topics.sh -p 'drub.*' -r 3 -y --apply    # RF=3, без подтверждения
+#   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact --apply
+#   ./repartition_topics.sh -p 'drub.*' --force --apply    # пересоздать даже непустые топики (потеря данных)
 #
 # Параметры:
 #   -p, --pattern PAT           ERE-паттерн имени топика (обязателен). Матчится целиком: ^PAT$
@@ -32,8 +38,11 @@
 #   -b, --bootstrap-server      адрес брокера host:port (или env BOOTSTRAP)
 #   -c, --command-config FILE   client.properties c SASL/SSL (или env CFG)
 #   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных); env FORCE=1
-#   -d, --dry-run               ничего не менять, только показать, что будет сделано
+#   -a, --apply                 выполнить изменения (без него — dry-run)
+#   -d, --dry-run               ничего не менять (режим по умолчанию, флаг оставлен для явности)
 #   -y, --yes                   не спрашивать подтверждение
+#       --report FILE           путь к файлу отчёта (по умолчанию report_<дата>_<время>.log)
+#       --no-report             не писать файл отчёта
 #       --no-color              без цветного вывода
 #   -h, --help                  эта справка
 #
@@ -48,6 +57,7 @@
 #   SSL_TRUSTSTORE_TYPE         = тип truststore (JKS/PKCS12), необязательно
 #   SSL_ENDPOINT_ID_ALGO        = ssl.endpoint.identification.algorithm (пусто = без проверки hostname)
 #   KAFKA_HOME                  = каталог установки Kafka (иначе kafka-topics.sh из PATH)
+#   REPORT_DIR                  = каталог для файла отчёта (по умолчанию текущий)
 #
 # Конфиги пересоздаваемых топиков (всё необязательно, приоритет: -C > TOPIC_CONFIGS > именованные):
 #   RETENTION_MS, RETENTION_BYTES, CLEANUP_POLICY, SEGMENT_MS, SEGMENT_BYTES,
@@ -65,8 +75,13 @@ PARTITIONS=1
 REPL_FACTOR=""
 BOOTSTRAP="${BOOTSTRAP:-localhost:9092}"
 CFG="${CFG:-}"
-DRY_RUN=0
+DRY_RUN=1               # 1 — безопасный режим по умолчанию; сбрасывается флагом --apply
 ASSUME_YES=0
+REPORT_ENABLED=1
+REPORT_DIR="${REPORT_DIR:-.}"
+REPORT_FILE=""          # заполняется автоматически: report_<дата>_<время>.log
+LOG_FIFO=""
+LOG_PID=""
 FORCE="${FORCE:-0}"     # 1 — пересоздавать даже непустые топики (потеря данных)
 USE_COLOR=1
 DELETE_WAIT=60          # сколько секунд ждать фактического удаления топика
@@ -87,24 +102,32 @@ repartition_topics.sh — пересоздание Kafka-топиков по п�
   -b, --bootstrap-server ADDR адрес брокера host:port (или env BOOTSTRAP)
   -c, --command-config FILE   client.properties с SASL/SSL (или env CFG)
   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных)
-  -d, --dry-run               ничего не менять, только показать план
+  -a, --apply                 РЕАЛЬНО выполнить изменения (без него — dry-run)
+  -d, --dry-run               ничего не менять (режим по умолчанию)
   -y, --yes                   не спрашивать подтверждение
+      --report FILE           путь к файлу отчёта (по умолчанию report_<дата>_<время>.log)
+      --no-report             не писать файл отчёта
       --no-color              без цветного вывода
   -h, --help                  эта справка
 
+По умолчанию — DRY-RUN: скрипт только показывает план. Изменения вносит только --apply.
+Ход выполнения дублируется в файл report_<ГГГГ-ММ-ДД>_<ЧЧ-ММ-СС>.log (см. --report / REPORT_DIR).
+
 Примеры:
-  KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*'
-  ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1
-  ./repartition_topics.sh -p 'drub.*' -d
-  ./repartition_topics.sh -p 'drub.*' -r 3 -y
-  ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact
-  ./repartition_topics.sh -p 'drub.*' --force
+  ./repartition_topics.sh -p 'drub.*'                                        # dry-run: только план
+  KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*' --apply
+  ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1 --apply
+  ./repartition_topics.sh -p 'drub.*' -r 3 -y --apply
+  ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact --apply
+  ./repartition_topics.sh -p 'drub.*' --force --apply
+  ./repartition_topics.sh -p 'drub.*' --report /var/log/kafka/repart.log --apply
 
 Подробное описание, переменные окружения и коды возврата — в комментариях в начале файла.
 EOF
 }
 
 # ---------- разбор аргументов ----------
+ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--pattern)             PATTERN="$2"; shift 2 ;;
@@ -114,8 +137,11 @@ while [[ $# -gt 0 ]]; do
     -b|--bootstrap-server)    BOOTSTRAP="$2"; shift 2 ;;
     -c|--command-config)      CFG="$2"; shift 2 ;;
     -f|--force)               FORCE=1; shift ;;
+    -a|--apply)               DRY_RUN=0; shift ;;
     -d|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
+    --report)                 REPORT_FILE="$2"; shift 2 ;;
+    --no-report)              REPORT_ENABLED=0; shift ;;
     --no-color)               USE_COLOR=0; shift ;;
     -h|--help)                usage; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
@@ -148,14 +174,73 @@ else
   warn "Почините хост: sudo chmod 666 /dev/null (или пересоздайте: mknod /dev/null c 1 3)"
 fi
 
+# ---------- отчёт о выполнении ----------
+# Весь вывод (stdout+stderr) идёт и на консоль, и в файл отчёта. Схема: скрипт пишет
+# в FIFO, фоновый tee раздаёт поток на консоль и в файл; на выходе поток закрывается,
+# tee дожидается конца, и из отчёта убираются ANSI-последовательности.
+start_report() {
+  [[ "$REPORT_ENABLED" -eq 1 ]] || return 0
+  local ts dir
+  ts="$(date '+%Y-%m-%d_%H-%M-%S')"
+  [[ -z "$REPORT_FILE" ]] && REPORT_FILE="${REPORT_DIR%/}/report_${ts}.log"
+  dir="$(dirname "$REPORT_FILE")"
+  if ! mkdir -p "$dir" 2>"$DEVNULL" || ! : > "$REPORT_FILE" 2>"$DEVNULL"; then
+    warn "Не удалось создать файл отчёта '$REPORT_FILE' — работаем без отчёта."
+    REPORT_FILE=""; return 0
+  fi
+  {
+    echo "# repartition_topics.sh — отчёт о выполнении"
+    echo "# Запуск:      $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "# Хост:        $(hostname 2>"$DEVNULL")   пользователь: $(id -un 2>"$DEVNULL")"
+    echo "# Каталог:     $PWD"
+    echo "# Команда:     $0 ${ORIG_ARGS[*]:-}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "# Режим:       DRY-RUN (изменения не вносятся)"
+    else
+      echo "# Режим:       APPLY (топики будут удалены и пересозданы)"
+    fi
+    echo
+  } >> "$REPORT_FILE"
+
+  LOG_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/repartition-log.XXXXXX")"
+  if ! mkfifo "$LOG_FIFO" 2>"$DEVNULL"; then
+    warn "mkfifo недоступен — отчёт будет неполным (только заголовок): $REPORT_FILE"
+    LOG_FIFO=""; return 0
+  fi
+  exec 3>&1                                   # 3 — настоящая консоль
+  tee -a "$REPORT_FILE" < "$LOG_FIFO" >&3 &
+  LOG_PID=$!
+  exec > "$LOG_FIFO" 2>&1                     # весь дальнейший вывод — через tee
+  return 0
+}
+
+finish_report() {
+  [[ -n "$LOG_FIFO" ]] || return 0
+  exec 1>&3 2>&3 3>&-                         # вернуть вывод на консоль, закрыть FIFO
+  wait "$LOG_PID" 2>"$DEVNULL"
+  rm -f "$LOG_FIFO"; LOG_FIFO=""
+  local tmp                                    # вычистить ANSI-цвета из отчёта
+  if tmp="$(mktemp "${TMPDIR:-/tmp}/repartition-rep.XXXXXX")"; then
+    if sed "s/$(printf '\033')\[[0-9;]*m//g" "$REPORT_FILE" > "$tmp" 2>"$DEVNULL"; then
+      cat "$tmp" > "$REPORT_FILE"
+    fi
+    rm -f "$tmp"
+  fi
+  printf '%sОтчёт сохранён: %s%s\n' "$C_HDR" "$REPORT_FILE" "$C_RST"
+  return 0
+}
+
 # ---------- уборка временных файлов ----------
 TMP_CFG=""
 cleanup() {
+  finish_report
   [[ -n "$TMP_CFG"  ]] && rm -f "$TMP_CFG"
   [[ -n "$TMP_NULL" ]] && rm -f "$TMP_NULL"
   return 0
 }
 trap cleanup EXIT
+
+start_report
 
 # ---------- проверка входных данных ----------
 [[ -z "$PATTERN" ]] && { bad "Не задан -p/--pattern"; echo "Подсказка: $0 --help" >&2; exit 2; }
@@ -329,6 +414,12 @@ if [[ "$FORCE" -eq 1 ]]; then
 else
   info "Непустые топики: пропускать (безопасный режим)"
 fi
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "Режим: DRY-RUN (по умолчанию) — ничего не меняем, только план"
+else
+  info "Режим: APPLY — топики будут удалены и пересозданы"
+fi
+[[ -n "$REPORT_FILE" ]] && info "Отчёт: $REPORT_FILE"
 
 # ---------- 2. подтверждение ----------
 if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 0 ]]; then
@@ -336,11 +427,13 @@ if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 0 ]]; then
     printf '\n%sВНИМАНИЕ: режим --force — НЕПУСТЫЕ топики будут удалены ВМЕСТЕ С ДАННЫМИ%s\n' "$C_BAD" "$C_RST"
     printf '%s(партиций: %s%s). Отмена невозможна.%s\n' "$C_BAD" "$PARTITIONS" "${REPL_FACTOR:+, RF: $REPL_FACTOR}" "$C_RST"
     read -r -p "Для подтверждения введите слово yes: " ans
+    info "Ответ оператора: '${ans}'"
     [[ "$ans" == "yes" ]] || { echo "Отменено."; exit 0; }
   else
     printf '\n%sБудут удалены и пересозданы ПУСТЫЕ топики выше (партиций: %s%s).%s\n' \
       "$C_WARN" "$PARTITIONS" "${REPL_FACTOR:+, RF: $REPL_FACTOR}" "$C_RST"
     read -r -p "Продолжить? [y/N] " ans
+    info "Ответ оператора: '${ans}'"
     [[ "$ans" =~ ^[Yy]$ ]] || { echo "Отменено."; exit 0; }
   fi
 fi
@@ -409,7 +502,8 @@ done
 step "Итог"
 info "Пересоздано: $RECREATED   Пропущено (непустые): $SKIPPED   Ошибок: $FAILED"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  printf '%sРежим dry-run — изменения не вносились.%s\n' "$C_HDR" "$C_RST"
+  printf '%sРежим dry-run (по умолчанию) — изменения не вносились.%s\n' "$C_HDR" "$C_RST"
+  printf '%sДля реального выполнения повторите ту же команду с флагом --apply.%s\n' "$C_HDR" "$C_RST"
 fi
 
 [[ "$FAILED" -eq 0 && "$SKIPPED" -eq 0 ]] && exit 0 || exit 1
