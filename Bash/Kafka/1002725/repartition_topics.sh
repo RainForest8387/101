@@ -6,6 +6,8 @@
 #   1. Находит топики, имя которых целиком соответствует паттерну (напр. 'drub.*').
 #   2. Для каждого топика проверяет, что он пустой (0 сообщений во всех партициях).
 #   3. Пустые — удаляет и создаёт заново с заданным числом партиций.
+#      Топики, у которых число партиций (и RF, если задан -r) уже совпадает с целевым,
+#      не трогает вовсе — пересоздавать их незачем; принудительно: --recreate.
 #   4. Непустые — по умолчанию пропускает (защита от потери данных);
 #      с флагом --force — удаляет и непустые и пустые и пересоздаёт (ДАННЫЕ БУДУТ ПОТЕРЯНЫ!).
 #
@@ -45,6 +47,8 @@
 #   -c, --command-config FILE   client.properties c SASL/SSL (или env CFG)
 #   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных); env FORCE=1
 #   -a, --apply                 выполнить изменения (без него — dry-run)
+#       --recreate              пересоздавать топик, даже если он уже соответствует целевым
+#                               параметрам (например, чтобы применить новые -C конфиги)
 #   -d, --dry-run               ничего не менять (режим по умолчанию, флаг оставлен для явности)
 #   -y, --yes                   не спрашивать подтверждение
 #       --delete-wait SEC       сколько секунд ждать реального удаления топика (по умолчанию 300;
@@ -93,6 +97,7 @@ REPORT_FILE=""          # заполняется автоматически: rep
 LOG_FIFO=""
 LOG_PID=""
 FORCE="${FORCE:-0}"     # 1 — пересоздавать даже непустые топики (потеря данных)
+RECREATE_ALWAYS=0       # 1 — пересоздавать, даже если параметры уже совпадают с целевыми
 USE_COLOR=1
 DELETE_WAIT="${DELETE_WAIT:-300}"   # сколько СЕКУНД ждать фактического удаления топика
 PENDING=()              # ждут второго круга: удаление отправлено, топик ещё виден
@@ -117,6 +122,7 @@ repartition_topics.sh — пересоздание Kafka-топиков по п�
   -c, --command-config FILE   client.properties с SASL/SSL (или env CFG)
   -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных)
   -a, --apply                 РЕАЛЬНО выполнить изменения (без него — dry-run)
+      --recreate              пересоздавать, даже если параметры уже совпадают с целевыми
   -d, --dry-run               ничего не менять (режим по умолчанию)
   -y, --yes                   не спрашивать подтверждение
       --delete-wait SEC       ждать удаления топика SEC секунд (по умолчанию 300)
@@ -154,6 +160,7 @@ while [[ $# -gt 0 ]]; do
     -c|--command-config)      CFG="$2"; shift 2 ;;
     -f|--force)               FORCE=1; shift ;;
     -a|--apply)               DRY_RUN=0; shift ;;
+    --recreate)               RECREATE_ALWAYS=1; shift ;;
     -d|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
     --delete-wait)            DELETE_WAIT="$2"; shift 2 ;;
@@ -372,6 +379,12 @@ topic_partitions() {
     | awk -F'PartitionCount:[[:space:]]*' 'NF>1{split($2,a,"[[:space:]]");print a[1];exit}'
 }
 
+# topic_repl_factor <topic> -> текущий replication factor (или пусто)
+topic_repl_factor() {
+  "$KAFKA_TOPICS" "${CONN[@]}" --describe --topic "$1" 2>"$DEVNULL" \
+    | awk -F'ReplicationFactor:[[:space:]]*' 'NF>1{split($2,a,"[[:space:]]");print a[1];exit}'
+}
+
 # topic_id <topic> -> TopicId из --describe (или пусто, если топика нет)
 topic_id() {
   "$KAFKA_TOPICS" "${CONN[@]}" --describe --topic "$1" 2>"$DEVNULL" \
@@ -529,13 +542,26 @@ if [[ "$DRY_RUN" -eq 0 && "$ASSUME_YES" -eq 0 ]]; then
 fi
 
 # ---------- 3. обработка ----------
-RECREATED=0; SKIPPED=0; FAILED=0
+RECREATED=0; SKIPPED=0; FAILED=0; UNCHANGED=0
 
 for topic in "${MATCHED[@]}"; do
   step "Топик: $topic"
 
   cur_parts="$(topic_partitions "$topic")"
   info "Текущее число партиций: ${cur_parts:-?}  ->  целевое: $PARTITIONS"
+
+  # Топик уже такой, какой нужен — не трогаем: пересоздание здесь только риск
+  # (гонка с авто-созданием, сброс конфигов, лишний простой). Принудительно: --recreate.
+  if [[ "$RECREATE_ALWAYS" -eq 0 && "$cur_parts" == "$PARTITIONS" ]]; then
+    cur_rf=""
+    [[ -n "$REPL_FACTOR" ]] && cur_rf="$(topic_repl_factor "$topic")"
+    if [[ -z "$REPL_FACTOR" || "$cur_rf" == "$REPL_FACTOR" ]]; then
+      ok "Уже соответствует целевому (партиций=$cur_parts${REPL_FACTOR:+, RF=$cur_rf}) — пропуск."
+      [[ -n "$CONFIG_SUMMARY" ]] && info "Конфиги -C не применялись: топик не пересоздавался."
+      UNCHANGED=$((UNCHANGED+1)); continue
+    fi
+    info "RF отличается: $cur_rf -> $REPL_FACTOR — топик будет пересоздан."
+  fi
 
   cnt="$(message_count "$topic")"
   if [[ "$cnt" == "ERR" ]]; then
@@ -595,7 +621,7 @@ fi
 
 # ---------- итог ----------
 step "Итог"
-info "Пересоздано: $RECREATED   Пропущено (непустые): $SKIPPED   Ошибок: $FAILED"
+info "Пересоздано: $RECREATED   Уже соответствовали: $UNCHANGED   Пропущено (непустые): $SKIPPED   Ошибок: $FAILED"
 if [[ "${#NOT_DELETED[@]}" -gt 0 ]]; then
   warn "НЕ УДАЛЕНЫ (остались с прежним числом партиций, потери данных нет) — ${#NOT_DELETED[@]}:"
   for topic in ${NOT_DELETED[@]+"${NOT_DELETED[@]}"}; do info "- $topic"; done
