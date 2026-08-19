@@ -18,6 +18,12 @@
 # Уменьшить число партиций штатным alter нельзя — только delete + create,
 # поэтому топик обязан быть пустым.
 #
+# Удаление топика в Kafka асинхронное: --delete лишь помечает топик, а метаданные и
+# сегменты чистятся фоном. Скрипт ждёт исчезновения топика до --delete-wait секунд, а
+# всё, что не успело, повторно проверяет и создаёт в конце (раздел "Отложенные топики").
+# Если топик не исчезает вообще — типично включён auto.create.topics.enable и живой
+# клиент пересоздаёт топик сразу после удаления: остановите клиентов и повторите.
+#
 # Подключение к брокеру: SASL_SSL / SCRAM-SHA-256 (готовый -c client.properties
 # либо генерация временного конфига из KAFKA_USER/KAFKA_PASSWORD — см. ниже).
 #
@@ -41,6 +47,9 @@
 #   -a, --apply                 выполнить изменения (без него — dry-run)
 #   -d, --dry-run               ничего не менять (режим по умолчанию, флаг оставлен для явности)
 #   -y, --yes                   не спрашивать подтверждение
+#       --delete-wait SEC       сколько секунд ждать реального удаления топика (по умолчанию 300;
+#                               env DELETE_WAIT). Удаление в Kafka асинхронное — при большом числе
+#                               топиков/партиций или занятом брокере увеличьте значение.
 #       --report FILE           путь к файлу отчёта (по умолчанию report_<дата>_<время>.log)
 #       --no-report             не писать файл отчёта
 #       --no-color              без цветного вывода
@@ -58,6 +67,7 @@
 #   SSL_ENDPOINT_ID_ALGO        = ssl.endpoint.identification.algorithm (пусто = без проверки hostname)
 #   KAFKA_HOME                  = каталог установки Kafka (иначе kafka-topics.sh из PATH)
 #   REPORT_DIR                  = каталог для файла отчёта (по умолчанию текущий)
+#   DELETE_WAIT                 = таймаут ожидания удаления топика, сек (по умолчанию 300)
 #
 # Конфиги пересоздаваемых топиков (всё необязательно, приоритет: -C > TOPIC_CONFIGS > именованные):
 #   RETENTION_MS, RETENTION_BYTES, CLEANUP_POLICY, SEGMENT_MS, SEGMENT_BYTES,
@@ -84,7 +94,11 @@ LOG_FIFO=""
 LOG_PID=""
 FORCE="${FORCE:-0}"     # 1 — пересоздавать даже непустые топики (потеря данных)
 USE_COLOR=1
-DELETE_WAIT=60          # сколько секунд ждать фактического удаления топика
+DELETE_WAIT="${DELETE_WAIT:-300}"   # сколько СЕКУНД ждать фактического удаления топика
+PENDING=()              # ждут второго круга: удаление отправлено, топик ещё виден
+PENDING_IDS=()          # TopicId этих топиков ДО удаления (для диагностики)
+NOT_CREATED=()          # удалены и так и не созданы — ДАННЫХ/ТОПИКА НЕТ, создать вручную
+NOT_DELETED=()          # удаление не сработало — топик остался как был
 RAW_CONFIGS=()         # значения флагов -C/--config (обрабатываются после определения хелперов)
 
 # ---------- краткая справка ----------
@@ -105,6 +119,7 @@ repartition_topics.sh — пересоздание Kafka-топиков по п�
   -a, --apply                 РЕАЛЬНО выполнить изменения (без него — dry-run)
   -d, --dry-run               ничего не менять (режим по умолчанию)
   -y, --yes                   не спрашивать подтверждение
+      --delete-wait SEC       ждать удаления топика SEC секунд (по умолчанию 300)
       --report FILE           путь к файлу отчёта (по умолчанию report_<дата>_<время>.log)
       --no-report             не писать файл отчёта
       --no-color              без цветного вывода
@@ -115,6 +130,7 @@ repartition_topics.sh — пересоздание Kafka-топиков по п�
 
 Примеры:
   ./repartition_topics.sh -p 'drub.*'                                        # dry-run: только план
+  ./repartition_topics.sh -p 'drub.fl.cert.*'                                # ERE, не glob: нужен '.*', а не '*'
   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*' --apply
   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1 --apply
   ./repartition_topics.sh -p 'drub.*' -r 3 -y --apply
@@ -140,6 +156,7 @@ while [[ $# -gt 0 ]]; do
     -a|--apply)               DRY_RUN=0; shift ;;
     -d|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
+    --delete-wait)            DELETE_WAIT="$2"; shift 2 ;;
     --report)                 REPORT_FILE="$2"; shift 2 ;;
     --no-report)              REPORT_ENABLED=0; shift ;;
     --no-color)               USE_COLOR=0; shift ;;
@@ -253,6 +270,9 @@ fi
 if [[ -n "$CFG" && ! -r "$CFG" ]]; then
   bad "command-config недоступен для чтения: $CFG"; exit 2
 fi
+if ! [[ "$DELETE_WAIT" =~ ^[0-9]+$ ]]; then
+  bad "Некорректный --delete-wait: '$DELETE_WAIT' (нужно целое число секунд)"; exit 2
+fi
 
 # ---------- сбор конфигов топика (дедуп по ключу, приоритет: -C > TOPIC_CONFIGS > именованные) ----------
 # Параллельные массивы (совместимо с bash 3.2 — без associative arrays).
@@ -352,6 +372,12 @@ topic_partitions() {
     | awk -F'PartitionCount:[[:space:]]*' 'NF>1{split($2,a,"[[:space:]]");print a[1];exit}'
 }
 
+# topic_id <topic> -> TopicId из --describe (или пусто, если топика нет)
+topic_id() {
+  "$KAFKA_TOPICS" "${CONN[@]}" --describe --topic "$1" 2>"$DEVNULL" \
+    | awk -F'TopicId:[[:space:]]*' 'NF>1{split($2,a,"[[:space:]]");print a[1];exit}'
+}
+
 # offsets_sum <topic> <time(-1|-2)> -> сумма offset'ов по всем партициям
 offsets_sum() {
   local topic="$1" time="$2"
@@ -378,13 +404,60 @@ message_count() {
   echo $(( latest - earliest ))
 }
 
-# wait_topic_gone <topic> -> ждёт исчезновения топика из --list
+# wait_topic_gone <topic> [секунд] -> ждёт исчезновения топика из метаданных.
+# Удаление в Kafka асинхронное: --delete лишь помечает топик, реальное удаление
+# сегментов и очистка метаданных занимают время (тем больше, чем больше топиков
+# и партиций удаляется одновременно). Ждём по реальным часам: каждый опрос — это
+# запуск JVM (kafka-topics.sh --list), который сам по себе занимает секунды.
 wait_topic_gone() {
-  local topic="$1" i
-  for (( i=0; i<DELETE_WAIT; i++ )); do
-    if ! list_all_topics | grep -qx -- "$topic"; then return 0; fi
-    sleep 1
+  local topic="$1" limit="${2:-$DELETE_WAIT}" deadline interval=2
+  deadline=$(( $(date +%s) + limit ))
+  while :; do
+    list_all_topics | grep -qx -- "$topic" || return 0
+    [[ "$(date +%s)" -ge "$deadline" ]] && return 1
+    sleep "$interval"
+    [[ "$interval" -lt 5 ]] && interval=$((interval+1))
   done
+}
+
+# create_topic <topic> -> создаёт топик с целевыми параметрами; 0 — успех
+create_topic() {
+  local topic="$1" new_parts i
+  local create_args=("${CONN[@]}" --create --topic "$topic" --partitions "$PARTITIONS")
+  [[ -n "$REPL_FACTOR" ]] && create_args+=(--replication-factor "$REPL_FACTOR")
+  for i in ${CONFIG_KEYS[@]+"${!CONFIG_KEYS[@]}"}; do
+    create_args+=(--config "${CONFIG_KEYS[$i]}=${CONFIG_VALS[$i]}")
+  done
+  if ! "$KAFKA_TOPICS" "${create_args[@]}" 2>&1 | sed 's/^/    /'; then
+    bad "Ошибка создания '$topic'."; return 1
+  fi
+  new_parts="$(topic_partitions "$topic")"
+  if [[ "$new_parts" == "$PARTITIONS" ]]; then
+    ok "Создан заново: партиций = $new_parts."; return 0
+  fi
+  bad "Создан, но партиций=$new_parts (ожидалось $PARTITIONS)."; return 1
+}
+
+# diagnose_stuck <topic> <topic_id_до_удаления> -> 0, если топика сейчас нет (можно создавать);
+# 1, если топик на месте — с объяснением, почему удаление не сработало.
+diagnose_stuck() {
+  local topic="$1" old_id="$2" new_id
+  new_id="$(topic_id "$topic")"
+  if [[ -z "$new_id" ]]; then
+    info "Топик в метаданных больше не виден — удаление всё-таки завершилось."
+    return 0
+  fi
+  if [[ -n "$old_id" && "$new_id" != "$old_id" ]]; then
+    bad "'$topic' был удалён и СРАЗУ ПЕРЕСОЗДАН клиентом (TopicId $old_id -> $new_id)."
+    info "Так бывает при auto.create.topics.enable=true и живом продюсере/консьюмере:"
+    info "клиент создаёт топик заново с брокерским num.partitions."
+    info "Остановите клиентов этого топика (или запретите им CREATE через ACL) и повторите."
+  else
+    bad "'$topic' НЕ УДАЛЁН брокером (TopicId прежний: ${new_id:-?}) — топик остался как был."
+    info "Проверьте: право DeleteTopics у пользователя из command-config;"
+    info "delete.topic.enable на брокере; оффлайн/несинхронные реплики топика"
+    info "(kafka-topics.sh --describe --topic '$topic' --unavailable-partitions)."
+  fi
   return 1
 }
 
@@ -402,6 +475,23 @@ while IFS= read -r _t; do [[ -n "$_t" ]] && MATCHED+=("$_t"); done \
   < <(printf '%s\n' "$ALL" | grep -E "^(${PATTERN})$" | sort)
 if [[ "${#MATCHED[@]}" -eq 0 ]]; then
   warn "Ни один топик не подходит под паттерн — делать нечего."
+  # Частая ошибка: паттерн пишут как glob ('cert*'), а это ERE, где '*' повторяет
+  # предыдущий символ. Подсказываем исправленный вариант и похожие топики.
+  if [[ "$PATTERN" =~ [^.]\* ]]; then
+    fixed="$(printf '%s' "$PATTERN" | sed -E 's/([^.])\*/\1.*/g')"
+    n="$(printf '%s\n' "$ALL" | grep -cE "^(${fixed})$")"
+    warn "Паттерн разбирается как ERE, а не как glob: '*' повторяет предыдущий символ,"
+    warn "то есть 'cert*' — это 'cer' + любое число 't', а не 'всё, что начинается с cert'."
+    info "Возможно, вы имели в виду:  -p '$fixed'   (подходящих топиков: $n)"
+  fi
+  literal="$(printf '%s' "$PATTERN" | sed -E 's/[][(){}*+?^$|\\].*//')"
+  if [[ -n "$literal" ]]; then
+    similar="$(printf '%s\n' "$ALL" | grep -F -- "$literal" | head -10)"
+    if [[ -n "$similar" ]]; then
+      info "Топики, содержащие '$literal':"
+      while IFS= read -r _t; do info "- $_t"; done <<< "$similar"
+    fi
+  fi
   exit 0
 fi
 ok "Найдено топиков: ${#MATCHED[@]}"
@@ -470,37 +560,53 @@ for topic in "${MATCHED[@]}"; do
   fi
 
   # удаление
+  old_id="$(topic_id "$topic")"
+  [[ -n "$old_id" ]] && info "TopicId до удаления: $old_id"
   if ! "$KAFKA_TOPICS" "${CONN[@]}" --delete --topic "$topic" 2>&1 | sed 's/^/    /'; then
-    bad "Ошибка удаления '$topic' — пропуск."; FAILED=$((FAILED+1)); continue
+    bad "Ошибка удаления '$topic' — пропуск (см. сообщение брокера выше)."
+    NOT_DELETED+=("$topic"); FAILED=$((FAILED+1)); continue
   fi
   if ! wait_topic_gone "$topic"; then
-    bad "Топик '$topic' не исчез за ${DELETE_WAIT}с — пропуск создания (проверьте вручную)."
-    FAILED=$((FAILED+1)); continue
+    warn "Ещё виден в метаданных через ${DELETE_WAIT}с — создание ОТЛОЖЕНО (повторим в конце)."
+    PENDING+=("$topic"); PENDING_IDS+=("$old_id"); continue
   fi
   ok "Удалён."
 
   # создание
-  create_args=("${CONN[@]}" --create --topic "$topic" --partitions "$PARTITIONS")
-  [[ -n "$REPL_FACTOR" ]] && create_args+=(--replication-factor "$REPL_FACTOR")
-  for i in ${CONFIG_KEYS[@]+"${!CONFIG_KEYS[@]}"}; do
-    create_args+=(--config "${CONFIG_KEYS[$i]}=${CONFIG_VALS[$i]}")
-  done
-  if "$KAFKA_TOPICS" "${create_args[@]}" 2>&1 | sed 's/^/    /'; then
-    new_parts="$(topic_partitions "$topic")"
-    if [[ "$new_parts" == "$PARTITIONS" ]]; then
-      ok "Создан заново: партиций = $new_parts."
-      RECREATED=$((RECREATED+1))
-    else
-      bad "Создан, но партиций=$new_parts (ожидалось $PARTITIONS)."; FAILED=$((FAILED+1))
-    fi
-  else
-    bad "Ошибка создания '$topic'."; FAILED=$((FAILED+1))
-  fi
+  if create_topic "$topic"; then RECREATED=$((RECREATED+1)); else FAILED=$((FAILED+1)); fi
 done
+
+# ---------- 4. отложенные топики (удаление ещё не доехало) ----------
+# Топик уже удалён командой --delete, поэтому бросать его нельзя: без создания
+# он просто исчезнет. Ждём второй круг и создаём всё, что успело удалиться.
+if [[ "${#PENDING[@]}" -gt 0 ]]; then
+  step "Отложенные топики: ${#PENDING[@]} (ждём завершения удаления)"
+  info "Удаление в Kafka асинхронное — даём каждому топику ещё до ${DELETE_WAIT}с."
+  for i in ${PENDING[@]+"${!PENDING[@]}"}; do
+    topic="${PENDING[$i]}"; old_id="${PENDING_IDS[$i]}"
+    if wait_topic_gone "$topic" || diagnose_stuck "$topic" "$old_id"; then
+      ok "'$topic': удаление завершено — создаём."
+      if create_topic "$topic"; then RECREATED=$((RECREATED+1)); else NOT_CREATED+=("$topic"); FAILED=$((FAILED+1)); fi
+    else
+      NOT_DELETED+=("$topic"); FAILED=$((FAILED+1))
+    fi
+  done
+fi
 
 # ---------- итог ----------
 step "Итог"
 info "Пересоздано: $RECREATED   Пропущено (непустые): $SKIPPED   Ошибок: $FAILED"
+if [[ "${#NOT_DELETED[@]}" -gt 0 ]]; then
+  warn "НЕ УДАЛЕНЫ (остались с прежним числом партиций, потери данных нет) — ${#NOT_DELETED[@]}:"
+  for topic in ${NOT_DELETED[@]+"${NOT_DELETED[@]}"}; do info "- $topic"; done
+  info "Разберитесь с причиной (права DeleteTopics / auto.create.topics.enable / реплики) и повторите."
+fi
+if [[ "${#NOT_CREATED[@]}" -gt 0 ]]; then
+  bad "УДАЛЕНЫ, НО НЕ СОЗДАНЫ — ${#NOT_CREATED[@]} топик(ов), создайте вручную:"
+  for topic in ${NOT_CREATED[@]+"${NOT_CREATED[@]}"}; do
+    info "$KAFKA_TOPICS --bootstrap-server $BOOTSTRAP --command-config $CFG --create --topic $topic --partitions $PARTITIONS${REPL_FACTOR:+ --replication-factor $REPL_FACTOR}"
+  done
+fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '%sРежим dry-run (по умолчанию) — изменения не вносились.%s\n' "$C_HDR" "$C_RST"
   printf '%sДля реального выполнения повторите ту же команду с флагом --apply.%s\n' "$C_HDR" "$C_RST"
