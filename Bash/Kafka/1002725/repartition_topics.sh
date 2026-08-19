@@ -134,6 +134,29 @@ warn() { printf '%s  [WARN] %s%s\n' "$C_WARN" "$*" "$C_RST"; }
 info() { printf '    %s\n' "$*"; }
 step() { printf '\n%s== %s ==%s\n' "$C_HDR" "$*" "$C_RST"; }
 
+# ---------- запасной сток вывода ----------
+# На некоторых хостах /dev/null имеет неверные права или подменён обычным файлом,
+# и тогда ЛЮБОЙ редирект в него падает с "Отказано в доступе" — например, проверка
+# `command -v ... >/dev/null` начинает возвращать "не найдено". Подстилаем временный файл.
+TMP_NULL=""
+if [[ -c /dev/null && -w /dev/null ]]; then
+  DEVNULL=/dev/null
+else
+  TMP_NULL="$(mktemp "${TMPDIR:-/tmp}/repartition-null.XXXXXX")" || TMP_NULL=""
+  DEVNULL="${TMP_NULL:-/dev/null}"
+  warn "/dev/null недоступен для записи — вывод глушится через $DEVNULL"
+  warn "Почините хост: sudo chmod 666 /dev/null (или пересоздайте: mknod /dev/null c 1 3)"
+fi
+
+# ---------- уборка временных файлов ----------
+TMP_CFG=""
+cleanup() {
+  [[ -n "$TMP_CFG"  ]] && rm -f "$TMP_CFG"
+  [[ -n "$TMP_NULL" ]] && rm -f "$TMP_NULL"
+  return 0
+}
+trap cleanup EXIT
+
 # ---------- проверка входных данных ----------
 [[ -z "$PATTERN" ]] && { bad "Не задан -p/--pattern"; echo "Подсказка: $0 --help" >&2; exit 2; }
 if ! [[ "$PARTITIONS" =~ ^[1-9][0-9]*$ ]]; then
@@ -185,12 +208,14 @@ done
 
 # ---------- поиск kafka-утилит ----------
 find_tool() {  # find_tool <basename> -> печатает путь или пусто
-  local name="$1"
+  local name="$1" path
   if [[ -n "${KAFKA_HOME:-}" && -x "$KAFKA_HOME/bin/$name" ]]; then
     printf '%s' "$KAFKA_HOME/bin/$name"
-  elif command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"
+    return 0
   fi
+  # без редиректов: command -v молчит, если не нашёл (не зависит от прав на /dev/null)
+  path="$(command -v "$name")" && printf '%s' "$path"
+  return 0
 }
 KAFKA_TOPICS="$(find_tool kafka-topics.sh)"
 KAFKA_OFFSETS="$(find_tool kafka-get-offsets.sh)"     # есть в Kafka >= 3.0
@@ -200,10 +225,6 @@ KAFKA_RUN_CLASS="$(find_tool kafka-run-class.sh)"      # запасной пут
 # ---------- аутентификация: SASL_SSL / SCRAM-SHA-256 ----------
 # Если готовый command-config не передан, но заданы KAFKA_USER/KAFKA_PASSWORD —
 # генерируем временный client.properties (права 600, удаляется на выходе).
-TMP_CFG=""
-cleanup() { [[ -n "$TMP_CFG" ]] && rm -f "$TMP_CFG"; }
-trap cleanup EXIT
-
 if [[ -z "$CFG" ]]; then
   if [[ -n "${KAFKA_USER:-}" && -n "${KAFKA_PASSWORD:-}" ]]; then
     if [[ "$KAFKA_PASSWORD" == *'"'* ]]; then
@@ -237,12 +258,12 @@ CONN=(--bootstrap-server "$BOOTSTRAP" --command-config "$CFG")
 
 # list_all_topics -> список всех топиков (по одному в строке)
 list_all_topics() {
-  "$KAFKA_TOPICS" "${CONN[@]}" --list 2>/dev/null
+  "$KAFKA_TOPICS" "${CONN[@]}" --list 2>"$DEVNULL"
 }
 
 # topic_partitions <topic> -> текущее число партиций (или пусто)
 topic_partitions() {
-  "$KAFKA_TOPICS" "${CONN[@]}" --describe --topic "$1" 2>/dev/null \
+  "$KAFKA_TOPICS" "${CONN[@]}" --describe --topic "$1" 2>"$DEVNULL" \
     | awk -F'PartitionCount:[[:space:]]*' 'NF>1{split($2,a,"[[:space:]]");print a[1];exit}'
 }
 
@@ -250,13 +271,13 @@ topic_partitions() {
 offsets_sum() {
   local topic="$1" time="$2"
   if [[ -n "$KAFKA_OFFSETS" ]]; then
-    "$KAFKA_OFFSETS" "${CONN[@]}" --topic "$topic" --time "$time" 2>/dev/null \
+    "$KAFKA_OFFSETS" "${CONN[@]}" --topic "$topic" --time "$time" 2>"$DEVNULL" \
       | awk -F: '{s+=$3} END{print s+0}'
   elif [[ -n "$KAFKA_RUN_CLASS" ]]; then
     local args=(--bootstrap-server "$BOOTSTRAP")
     [[ -n "$CFG" ]] && args+=(--command-config "$CFG")
     "$KAFKA_RUN_CLASS" kafka.tools.GetOffsetShell "${args[@]}" \
-      --topic "$topic" --time "$time" 2>/dev/null \
+      --topic "$topic" --time "$time" 2>"$DEVNULL" \
       | awk -F: '{s+=$3} END{print s+0}'
   else
     echo "ERR"
