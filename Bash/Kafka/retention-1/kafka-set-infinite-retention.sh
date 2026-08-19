@@ -176,16 +176,16 @@ declare -a TOUCHED=()
 
 for T in "${ALL_TOPICS[@]}"; do
   if [[ $INCLUDE_INTERNAL -eq 0 && "$T" == _* ]]; then
-    echo "[skip] $T — служебный топик"; ((SKIPPED++)); continue
+    echo "[skip] $T — служебный топик"; SKIPPED=$((SKIPPED + 1)); continue
   fi
   if ! [[ "$T" =~ $INCLUDE_REGEX ]]; then
-    echo "[skip] $T — не подходит под --include"; ((SKIPPED++)); continue
+    echo "[skip] $T — не подходит под --include"; SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [[ "$T" =~ $EXCLUDE_REGEX ]]; then
-    echo "[skip] $T — подходит под --exclude"; ((SKIPPED++)); continue
+    echo "[skip] $T — подходит под --exclude"; SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [[ $ONLY_NONEMPTY -eq 1 ]] && ! topic_has_data "$T"; then
-    echo "[skip] $T — нет данных"; ((SKIPPED++)); continue
+    echo "[skip] $T — нет данных"; SKIPPED=$((SKIPPED + 1)); continue
   fi
 
   # текущая конфигурация -> бэкап
@@ -215,16 +215,16 @@ for T in "${ALL_TOPICS[@]}"; do
 
   if [[ $APPLY -eq 0 ]]; then
     echo "[dry-run] $T <- $NEW_CONFIG"
-    ((CHANGED++)); TOUCHED+=("$T"); continue
+    CHANGED=$((CHANGED + 1)); TOUCHED+=("$T"); continue
   fi
 
   if "$KCONFIGS" --bootstrap-server "$BOOTSTRAP" "${CC_ARGS[@]}" \
        --entity-type topics --entity-name "$T" --alter --add-config "$NEW_CONFIG" >/dev/null 2>&1; then
     echo "[ok]   $T <- $NEW_CONFIG"
-    ((CHANGED++)); TOUCHED+=("$T")
+    CHANGED=$((CHANGED + 1)); TOUCHED+=("$T")
   else
     echo "[FAIL] $T — не удалось изменить конфигурацию" >&2
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
   fi
 done
 
@@ -241,7 +241,12 @@ if [[ $APPLY -eq 1 && ${#TOUCHED[@]} -gt 0 ]]; then
 fi
 
 echo
+PROCESSED=$((CHANGED + SKIPPED + FAILED))
 echo "Итого: изменено=$CHANGED, пропущено=$SKIPPED, ошибок=$FAILED"
+echo "Обработано $PROCESSED из ${#ALL_TOPICS[@]} топиков в кластере"
+if [[ $PROCESSED -ne ${#ALL_TOPICS[@]} ]]; then
+  echo "ВНИМАНИЕ: обработаны не все топики — цикл завершился преждевременно!" >&2
+fi
 echo "Бэкап конфигураций: $BACKUP_DIR"
 echo "Скрипт отката:      $ROLLBACK"
 [[ $APPLY -eq 0 ]] && echo "Это был DRY-RUN. Для применения добавьте --apply."
