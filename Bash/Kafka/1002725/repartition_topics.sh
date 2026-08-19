@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # repartition_topics.sh — пересоздание Kafka-топиков по паттерну с новым числом партиций.
 #
