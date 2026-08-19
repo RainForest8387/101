@@ -72,6 +72,38 @@ USE_COLOR=1
 DELETE_WAIT=60          # сколько секунд ждать фактического удаления топика
 RAW_CONFIGS=()         # значения флагов -C/--config (обрабатываются после определения хелперов)
 
+# ---------- краткая справка ----------
+usage() {
+  cat <<'EOF'
+repartition_topics.sh — пересоздание Kafka-топиков по паттерну с новым числом партиций.
+
+Использование: repartition_topics.sh -p PATTERN [опции]
+
+Опции:
+  -p, --pattern PAT           ERE-паттерн имени топика (обязателен), матчится целиком: ^PAT$
+  -N, --partitions N          новое число партиций (по умолчанию 1)
+  -r, --replication-factor N  RF нового топика (по умолчанию — дефолт брокера)
+  -C, --config KEY=VALUE      конфиг нового топика, можно повторять (retention.ms, cleanup.policy, ...)
+  -b, --bootstrap-server ADDR адрес брокера host:port (или env BOOTSTRAP)
+  -c, --command-config FILE   client.properties с SASL/SSL (или env CFG)
+  -f, --force                 пересоздавать и НЕПУСТЫЕ топики (потеря данных)
+  -d, --dry-run               ничего не менять, только показать план
+  -y, --yes                   не спрашивать подтверждение
+      --no-color              без цветного вывода
+  -h, --help                  эта справка
+
+Примеры:
+  KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*'
+  ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1
+  ./repartition_topics.sh -p 'drub.*' -d
+  ./repartition_topics.sh -p 'drub.*' -r 3 -y
+  ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact
+  ./repartition_topics.sh -p 'drub.*' --force
+
+Подробное описание, переменные окружения и коды возврата — в комментариях в начале файла.
+EOF
+}
+
 # ---------- разбор аргументов ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,7 +117,7 @@ while [[ $# -gt 0 ]]; do
     -d|--dry-run)             DRY_RUN=1; shift ;;
     -y|--yes)                 ASSUME_YES=1; shift ;;
     --no-color)               USE_COLOR=0; shift ;;
-    -h|--help)                grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)                usage; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
 done
