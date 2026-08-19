@@ -25,6 +25,7 @@ ONLY_NONEMPTY=0                     # менять только топики, г
 INCLUDE_INTERNAL=0                  # включать служебные топики (__consumer_offsets и т.п.)
 SET_BYTES=1                         # выставлять также retention.bytes=-1
 SET_LOCAL=0                         # local.retention.ms=-1 (tiered storage, KIP-405)
+COMPACT_MODE="warn"                 # warn | skip | to-delete
 INCLUDE_REGEX='.*'
 EXCLUDE_REGEX='^$'
 BACKUP_DIR="./kafka-retention-backup-$(date +%Y%m%d-%H%M%S)"
@@ -45,6 +46,11 @@ usage() {
       --only-nonempty                Менять только топики, где есть данные
       --no-bytes                     Не трогать retention.bytes
       --local-retention              Также выставить local.retention.ms=-1 (tiered storage)
+      --compact-mode MODE            Что делать с топиками cleanup.policy=compact:
+                                       warn      - предупредить и обработать (по умолчанию)
+                                       skip      - не трогать вообще
+                                       to-delete - сменить политику на delete
+                                                   (ОПАСНО: ломает семантику compacted-топика)
       --backup-dir DIR               Каталог для бэкапа и rollback-скрипта
   -h, --help, help                   Показать эту справку
                                      (запуск без аргументов делает то же самое)
@@ -90,6 +96,13 @@ while [[ $# -gt 0 ]]; do
     --only-nonempty)       ONLY_NONEMPTY=1; shift ;;
     --no-bytes)            SET_BYTES=0; shift ;;
     --local-retention)     SET_LOCAL=1; shift ;;
+    --compact-mode)
+      need_val "$@"
+      case "$2" in
+        warn|skip|to-delete) COMPACT_MODE="$2" ;;
+        *) echo "ОШИБКА: --compact-mode принимает warn|skip|to-delete, получено '$2'." >&2; exit 1 ;;
+      esac
+      shift 2 ;;
     --backup-dir)          need_val "$@"; BACKUP_DIR="$2"; shift 2 ;;
     -h|-\?|--help|help)    usage; exit 0 ;;
     *)
@@ -193,18 +206,35 @@ for T in "${ALL_TOPICS[@]}"; do
           --entity-type topics --entity-name "$T" --describe 2>/dev/null || true)"
   printf '%s\n' "$CUR" > "$BACKUP_DIR/${T//\//_}.conf"
 
-  # предупреждение про compaction: retention.ms там не управляет удалением
+  # cleanup.policy: при compact удаление по времени не работает
   POLICY="$(grep -oE '(^|[[:space:]])cleanup\.policy=[a-z,]+' <<<"$CUR" | head -1 | cut -d= -f2 || true)"
-  if [[ "$POLICY" == "compact" ]]; then
-    echo "[warn] $T — cleanup.policy=compact, retention.ms не влияет на удаление (compaction продолжится)"
+  [[ -z "$POLICY" ]] && POLICY="delete"   # topic-level не задан -> брокерный дефолт
+
+  TCONF="$NEW_CONFIG"
+  if [[ "$POLICY" == *compact* ]]; then
+    echo "$T	cleanup.policy=$POLICY" >> "$BACKUP_DIR/compacted-topics.txt"
+    case "$COMPACT_MODE" in
+      skip)
+        echo "[skip] $T — cleanup.policy=$POLICY (--compact-mode skip)"
+        SKIPPED=$((SKIPPED + 1)); continue ;;
+      to-delete)
+        echo "[warn] $T — cleanup.policy=$POLICY -> delete (история ключей перестанет схлопываться)"
+        TCONF="$TCONF,cleanup.policy=delete" ;;
+      *)
+        if [[ "$POLICY" == "compact" ]]; then
+          echo "[warn] $T — cleanup.policy=compact: retention.ms не управляет удалением, compaction продолжится"
+        else
+          echo "[warn] $T — cleanup.policy=$POLICY: compaction продолжится, но удаление по времени отключается"
+        fi ;;
+    esac
   fi
 
   # строки отката
   {
-    echo "# --- $T ---"
-    for KEY in retention.ms retention.bytes local.retention.ms; do
-      [[ "$NEW_CONFIG" == *"$KEY="* ]] || continue
-      OLD="$(grep -oE "(^|[[:space:]])${KEY//./\\.}=[-0-9]+" <<<"$CUR" | head -1 | cut -d= -f2 || true)"
+    echo "# --- $T (cleanup.policy=$POLICY) ---"
+    for KEY in retention.ms retention.bytes local.retention.ms cleanup.policy; do
+      [[ "$TCONF" == *"$KEY="* ]] || continue
+      OLD="$(grep -oE "(^|[[:space:]])${KEY//./\\.}=[A-Za-z0-9,.-]+" <<<"$CUR" | head -1 | cut -d= -f2 || true)"
       if [[ -n "$OLD" ]]; then
         echo "$KCONFIGS --bootstrap-server '$BOOTSTRAP' ${CC_ARGS[*]} --entity-type topics --entity-name '$T' --alter --add-config '$KEY=$OLD'"
       else
@@ -214,13 +244,13 @@ for T in "${ALL_TOPICS[@]}"; do
   } >> "$ROLLBACK"
 
   if [[ $APPLY -eq 0 ]]; then
-    echo "[dry-run] $T <- $NEW_CONFIG"
+    echo "[dry-run] $T <- $TCONF"
     CHANGED=$((CHANGED + 1)); TOUCHED+=("$T"); continue
   fi
 
   if "$KCONFIGS" --bootstrap-server "$BOOTSTRAP" "${CC_ARGS[@]}" \
-       --entity-type topics --entity-name "$T" --alter --add-config "$NEW_CONFIG" >/dev/null 2>&1; then
-    echo "[ok]   $T <- $NEW_CONFIG"
+       --entity-type topics --entity-name "$T" --alter --add-config "$TCONF" >/dev/null 2>&1; then
+    echo "[ok]   $T <- $TCONF"
     CHANGED=$((CHANGED + 1)); TOUCHED+=("$T")
   else
     echo "[FAIL] $T — не удалось изменить конфигурацию" >&2
@@ -248,6 +278,9 @@ if [[ $PROCESSED -ne ${#ALL_TOPICS[@]} ]]; then
   echo "ВНИМАНИЕ: обработаны не все топики — цикл завершился преждевременно!" >&2
 fi
 echo "Бэкап конфигураций: $BACKUP_DIR"
+if [[ -f "$BACKUP_DIR/compacted-topics.txt" ]]; then
+  echo "Compacted-топиков:  $(wc -l < "$BACKUP_DIR/compacted-topics.txt") (список: $BACKUP_DIR/compacted-topics.txt)"
+fi
 echo "Скрипт отката:      $ROLLBACK"
 [[ $APPLY -eq 0 ]] && echo "Это был DRY-RUN. Для применения добавьте --apply."
 exit 0
