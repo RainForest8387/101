@@ -23,11 +23,11 @@
 #
 # Использование:
 #   ./repartition_topics.sh -p 'drub.*'                  # dry-run (по умолчанию): только план
-#   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*' --apply   # -> 1 партиция
+#   KAFKA_USER=svc KAFKA_PASSWORD=secret ./repartition_topics.sh -p 'drub.*' # пример запуска с переменными окружения
 #   ./repartition_topics.sh -p 'drub.*' -c client.properties --partitions 1 --apply
 #   ./repartition_topics.sh -p 'drub.*' -r 3 -y --apply    # RF=3, без подтверждения
 #   ./repartition_topics.sh -p 'drub.*' -C retention.ms=604800000 -C cleanup.policy=compact --apply
-#   ./repartition_topics.sh -p 'drub.*' --force --apply    # пересоздать даже непустые топики (потеря данных)
+#   ./repartition_topics.sh -p 'drub.*' --force --apply    # пересоздать даже непустые топики (потеря данных!)
 #
 # Параметры:
 #   -p, --pattern PAT           ERE-паттерн имени топика (обязателен). Матчится целиком: ^PAT$
