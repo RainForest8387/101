@@ -1,0 +1,44 @@
+# /etc/systemd/system/systemd-units-watcher.service
+#
+# Разовая проверка Kafka-стека. Сам по себе не включается (нет [Install]) —
+# запускается только таймером systemd-units-watcher.timer либо вручную:
+#   systemctl start systemd-units-watcher.service
+#   journalctl -u systemd-units-watcher.service -f
+
+[Unit]
+Description=Watchdog: проверка и автоподъём zookeeper/kafka/schema-registry
+Documentation=file:/opt/systemd-units-watcher/systemd-units-watcher.sh
+# Смысла работать до готовности systemd/сети нет
+After=network-online.target
+Wants=network-online.target
+
+# Только упорядочивание, без Wants=/Requires= — эти юниты сюда НЕ подтягиваются.
+# Нужно для догоняющего запуска (Persistent=true в таймере): он попадает в ту же
+# очередь заданий, что и обычный старт сервисов при загрузке, и без After=
+# watchdog мог бы проверить Kafka раньше, чем systemd её вообще начал поднимать.
+After=zookeeper.service kafka.service schema-registry.service
+
+[Service]
+Type=oneshot
+# --apply включает реальные действия (без него скрипт только смотрит).
+# Порядок -u задаёт порядок запуска: ZooKeeper -> Kafka -> Schema Registry.
+ExecStart=/opt/systemd-units-watcher/systemd-units-watcher.sh \
+    --apply \
+    --no-color \
+    --timeout 120 \
+    --settle 15 \
+    --retries 2 \
+    -u zookeeper.service \
+    -u kafka.service \
+    -u schema-registry.service
+
+# Худший случай: 3 юнита x (120s ожидания x 3 попытки + паузы). Берём с запасом.
+TimeoutStartSec=1200
+User=root
+# Свой вывод в journald, ищется по journalctl -t units-watcher
+SyslogIdentifier=units-watcher
+StandardOutput=journal
+StandardError=journal
+# Watchdog не должен сам себя ронять, если один из юнитов не поднялся:
+# ненулевой код нужен для истории в journal, а не для рестарта.
+SuccessExitStatus=0 1
