@@ -1,0 +1,11 @@
+# секреты и локальное состояние
+*.vault
+.vault_pass*
+vault_password*
+*.retry
+logs/
+.facts/
+check-workstation-report.json
+ansible-offline-bundle/
+ansible-offline-bundle.tar.gz
+*.whl

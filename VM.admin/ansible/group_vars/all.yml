@@ -1,0 +1,13 @@
+---
+# Общие переменные для всех хостов.
+# Секреты сюда не кладём — только в ansible-vault (см. README, раздел "Секреты").
+
+ansible_connection: ssh
+
+# Повышение привилегий выключено по умолчанию: включаем точечно
+# в конкретной задаче или через ключ --become.
+ansible_become: false
+ansible_become_method: sudo
+
+# Куда складывать бэкапы файлов, которые правят плейбуки (модули с backup: true).
+baseline_backup_dir: /var/backups/ansible

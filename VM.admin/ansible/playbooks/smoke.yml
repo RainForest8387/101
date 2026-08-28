@@ -1,0 +1,41 @@
+---
+# Проверка связности и готовности парка. Ничего не меняет.
+#   ansible-playbook playbooks/smoke.yml
+#   ansible-playbook playbooks/smoke.yml -l astra18
+- name: Проверка доступности и совместимости хостов
+  hosts: all
+  gather_facts: true
+  any_errors_fatal: false
+
+  tasks:
+    - name: Ответ по SSH
+      ansible.builtin.ping:
+
+    - name: Версия Astra Linux
+      ansible.builtin.slurp:
+        src: /etc/astra_version
+      register: astra_version_raw
+      failed_when: false
+
+    - name: Версия python на управляемом хосте
+      ansible.builtin.command: "{{ ansible_python_interpreter | default('/usr/bin/python3') }} -V"
+      changed_when: false
+      register: target_python
+
+    - name: Проверка sudo без пароля
+      ansible.builtin.command: id -u
+      become: true
+      changed_when: false
+      failed_when: false
+      register: sudo_check
+
+    - name: Сводка
+      ansible.builtin.debug:
+        msg:
+          - "хост            : {{ inventory_hostname }} ({{ ansible_host | default('-') }})"
+          - "ОС              : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "astra_version   : {{ (astra_version_raw.content | b64decode | trim) if astra_version_raw.content is defined else 'файл отсутствует' }}"
+          - "ядро            : {{ ansible_kernel }}"
+          - "python (target) : {{ target_python.stdout | default(target_python.stderr) | trim }}"
+          - "sudo без пароля : {{ 'да' if sudo_check.rc == 0 else 'нет (rc=' ~ sudo_check.rc ~ ')' }}"
+          - "uptime          : {{ (ansible_uptime_seconds | default(0) / 86400) | round(1) }} сут."

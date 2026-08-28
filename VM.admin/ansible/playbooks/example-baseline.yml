@@ -1,0 +1,83 @@
+---
+# Пример изменяющего плейбука. Показывает принятый порядок работы:
+#   1) прогон в --check --diff, 2) прогон на одном хосте, 3) прогон на группе.
+#
+#   ansible-playbook playbooks/example-baseline.yml --check --diff
+#   ansible-playbook playbooks/example-baseline.yml -l astra-app-01
+#   ansible-playbook playbooks/example-baseline.yml -l astra17 --tags time
+#
+# ВНИМАНИЕ: перед первым боевым запуском вычитайте задачи и правьте под свои стандарты.
+- name: Базовая настройка хостов Astra Linux
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    baseline_timezone: Europe/Moscow
+    baseline_ntp_servers:
+      - 10.0.0.1
+      - 10.0.0.2
+    baseline_packages:
+      - htop
+      - tmux
+      - curl
+
+  pre_tasks:
+    - name: Отсечь неподдерживаемые системы
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Astra Linux' or ansible_distribution is search('Astra')
+        fail_msg: "{{ inventory_hostname }}: не Astra Linux, плейбук пропущен"
+        success_msg: "{{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      tags: always
+
+  tasks:
+    - name: Часовой пояс
+      community.general.timezone:
+        name: "{{ baseline_timezone }}"
+      notify: restart cron
+      tags: time
+
+    - name: Серверы времени в chrony
+      ansible.builtin.template:
+        src: ../templates/chrony.conf.j2
+        dest: /etc/chrony/chrony.conf
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+      when: baseline_ntp_servers | length > 0
+      notify: restart chrony
+      tags: time
+      # Шаблон в комплект не входит — создайте templates/chrony.conf.j2 под свой стандарт.
+      # До этого момента задачу можно пропустить: --skip-tags time
+
+    - name: Утилиты администрирования
+      ansible.builtin.apt:
+        name: "{{ baseline_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      tags: packages
+
+    - name: Баннер входа
+      ansible.builtin.copy:
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          {{ inventory_hostname }} — {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Управляется Ansible. Ручные правки будут перезаписаны.
+      tags: motd
+
+  handlers:
+    - name: restart chrony
+      ansible.builtin.service:
+        name: chrony
+        state: restarted
+
+    - name: restart cron
+      ansible.builtin.service:
+        name: cron
+        state: restarted

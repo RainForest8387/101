@@ -1,0 +1,45 @@
+---
+# Сбор паспорта парка в CSV на control node. Только чтение.
+#   ansible-playbook playbooks/astra-inventory.yml
+#   результат: logs/inventory-YYYY-MM-DD.csv
+- name: Паспорт парка Astra Linux
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: Версия Astra
+      ansible.builtin.slurp:
+        src: /etc/astra_version
+      register: astra_raw
+      failed_when: false
+
+    - name: Состояние обновлений apt
+      ansible.builtin.command: apt-get -s upgrade
+      changed_when: false
+      failed_when: false
+      register: apt_sim
+
+- name: Запись отчёта
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  run_once: true
+
+  vars:
+    report_path: "{{ playbook_dir }}/../logs/inventory-{{ '%Y-%m-%d' | strftime }}.csv"
+
+  tasks:
+    - name: Сформировать CSV
+      ansible.builtin.copy:
+        dest: "{{ report_path }}"
+        mode: '0644'
+        content: |
+          host,ip,distribution,version,astra_version,kernel,python,cpu,mem_mb,upgradable
+          {% for h in groups['all'] %}
+          {% set f = hostvars[h] %}
+          {{ h }},{{ f.ansible_host | default(f.ansible_default_ipv4.address | default('-')) }},{{ f.ansible_distribution | default('-') }},{{ f.ansible_distribution_version | default('-') }},{{ (f.astra_raw.content | b64decode | trim) if f.astra_raw is defined and f.astra_raw.content is defined else '-' }},{{ f.ansible_kernel | default('-') }},{{ f.ansible_python_version | default('-') }},{{ f.ansible_processor_vcpus | default('-') }},{{ f.ansible_memtotal_mb | default('-') }},{{ (f.apt_sim.stdout_lines | default([]) | select('search', '^Inst ') | list | length) if f.apt_sim is defined else '-' }}
+          {% endfor %}
+
+    - name: Где отчёт
+      ansible.builtin.debug:
+        msg: "Отчёт: {{ report_path }}"
