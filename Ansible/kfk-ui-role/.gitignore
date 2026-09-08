@@ -1,0 +1,8 @@
+# Пароли от ansible-vault — только локально
+.vault_pass*
+*.vault_pass
+vault_pass.txt
+
+# Расшифрованные копии секретов
+**/vault.yml.decrypted
+**/*.plain.yml

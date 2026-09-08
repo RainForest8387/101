@@ -1,0 +1,48 @@
+---
+- name: Create directory for Kafka TLS stores
+  ansible.builtin.file:
+    path: "{{ kafka_ui_ssl_dir }}"
+    state: directory
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "0750"
+  when: >-
+    (kafka_ui_ssl_truststore_src | default('') | length) > 0 or
+    (kafka_ui_ssl_keystore_src | default('') | length) > 0
+
+- name: Copy Kafka truststore
+  ansible.builtin.copy:
+    src: "{{ kafka_ui_ssl_truststore_src }}"
+    dest: "{{ _kafka_ui_truststore_dest }}"
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "0640"
+  when: (kafka_ui_ssl_truststore_src | default('') | length) > 0
+  notify: Restart kafka-ui
+
+- name: Copy Kafka keystore (mTLS)
+  ansible.builtin.copy:
+    src: "{{ kafka_ui_ssl_keystore_src }}"
+    dest: "{{ _kafka_ui_keystore_dest }}"
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "0640"
+  when: (kafka_ui_ssl_keystore_src | default('') | length) > 0
+  notify: Restart kafka-ui
+
+- name: Check that the truststore is present on the target host
+  ansible.builtin.stat:
+    path: "{{ _kafka_ui_truststore_dest }}"
+  register: _kafka_ui_truststore_stat
+  when: (_kafka_ui_truststore_dest | length) > 0
+
+- name: Fail when the truststore is missing on the target host
+  ansible.builtin.fail:
+    msg: >-
+      Truststore {{ _kafka_ui_truststore_dest }} не найден на хосте.
+      Укажите kafka_ui_ssl_truststore_src (файл в files/ роли) либо
+      разместите файл заранее и задайте kafka_ui_ssl_truststore_path.
+  when:
+    - not ansible_check_mode
+    - (_kafka_ui_truststore_dest | length) > 0
+    - not (_kafka_ui_truststore_stat.stat.exists | default(false))

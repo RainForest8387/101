@@ -1,0 +1,26 @@
+---
+# Шаблон зашифрованного файла с секретами.
+#
+#   cp vault.yml.example vault.yml
+#   ansible-vault encrypt vault.yml
+#
+# или сразу:
+#
+#   ansible-vault create examples/group_vars/kafka_ui/vault.yml
+#
+# Имена переменных с префиксом vault_ используются в main.yml.
+# Сам vault.yml коммитить в git МОЖНО (он зашифрован),
+# vault.yml.example — только с фиктивными значениями.
+
+# Пароль администратора web-интерфейса kafka-ui (auth type LOGIN_FORM)
+vault_kafka_ui_admin_password: "CHANGE_ME"
+
+# Пароль пользователя SCRAM-SHA-256 в кластере Kafka
+vault_kafka_sasl_password: "CHANGE_ME"
+
+# Пароль truststore (kafka.truststore.jks)
+vault_kafka_truststore_password: "CHANGE_ME"
+
+# Пароли keystore, если используется mTLS
+# vault_kafka_keystore_password: "CHANGE_ME"
+# vault_kafka_key_password: "CHANGE_ME"

@@ -1,0 +1,39 @@
+---
+# Открытые параметры группы kafka_ui.
+# Все пароли берутся из зашифрованного examples/group_vars/kafka_ui/vault.yml
+# (см. раздел "Секреты и ansible-vault" в README.md).
+
+kafka_ui_version: "0.7.2"
+kafka_ui_server_port: 8080
+
+# --- доступ в web-интерфейс ---
+kafka_ui_auth_type: "LOGIN_FORM"
+kafka_ui_admin_user: "admin"
+kafka_ui_admin_password: "{{ vault_kafka_ui_admin_password }}"
+
+# --- подключение к Kafka: SASL_SSL / SCRAM-SHA-256, порт 9094 ---
+kafka_ui_security_protocol: "SASL_SSL"
+kafka_ui_sasl_mechanism: "SCRAM-SHA-256"
+kafka_ui_sasl_username: "kafka-ui"
+kafka_ui_sasl_password: "{{ vault_kafka_sasl_password }}"
+
+kafka_ui_ssl_truststore_src: "kafka.truststore.jks"
+kafka_ui_ssl_truststore_password: "{{ vault_kafka_truststore_password }}"
+kafka_ui_ssl_truststore_type: "JKS"
+# если сертификаты брокеров выписаны не на их FQDN — снять проверку:
+# kafka_ui_ssl_endpoint_identification_algorithm: ""
+
+# Не показывать содержимое шаблонов с паролями в выводе ansible-playbook
+kafka_ui_no_log: true
+
+kafka_ui_clusters:
+  - name: "prod"
+    bootstrapServers: "kfk-01.example.local:9094,kfk-02.example.local:9094,kfk-03.example.local:9094"
+    readOnly: false
+    metrics:
+      type: JMX
+      port: 9997
+
+  - name: "stage"
+    bootstrapServers: "kfk-stage.example.local:9094"
+    readOnly: true
