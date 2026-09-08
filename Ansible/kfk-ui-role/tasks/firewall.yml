@@ -1,0 +1,13 @@
+---
+- name: Check whether ufw is available
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: _kafka_ui_ufw
+
+- name: Allow kafka-ui port in ufw
+  community.general.ufw:
+    rule: allow
+    port: "{{ kafka_ui_server_port }}"
+    proto: tcp
+    comment: "kafka-ui"
+  when: _kafka_ui_ufw.stat.exists

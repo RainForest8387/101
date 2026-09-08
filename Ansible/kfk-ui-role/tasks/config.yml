@@ -1,0 +1,21 @@
+---
+- name: Render application.yml
+  ansible.builtin.template:
+    src: application.yml.j2
+    dest: "{{ _kafka_ui_conf_file }}"
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "{{ kafka_ui_conf_file_mode }}"
+    backup: true
+  no_log: "{{ kafka_ui_no_log | bool }}"
+  notify: Restart kafka-ui
+
+- name: Render environment file
+  ansible.builtin.template:
+    src: kafka-ui.env.j2
+    dest: "{{ _kafka_ui_env_file }}"
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "{{ kafka_ui_conf_file_mode }}"
+  no_log: "{{ kafka_ui_no_log | bool }}"
+  notify: Restart kafka-ui

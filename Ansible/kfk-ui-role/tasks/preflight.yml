@@ -1,0 +1,54 @@
+---
+- name: Assert supported OS family (Astra Linux / Debian)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in ['Debian', 'Astra Linux']
+    fail_msg: >-
+      Роль поддерживает только Astra Linux и другие Debian-подобные ОС,
+      обнаружено: {{ ansible_facts['distribution'] }}
+      ({{ ansible_facts['os_family'] }}).
+    quiet: true
+
+- name: Check that kafka-ui JAR is present in the role files/ directory
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/{{ kafka_ui_jar_name }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  check_mode: false
+  register: _kafka_ui_local_jar
+
+- name: Fail with download instructions when JAR is missing
+  ansible.builtin.fail:
+    msg: |
+      Файл {{ kafka_ui_jar_name }} не найден в {{ role_path }}/files/.
+      Скачайте его вручную и положите в каталог files/ роли:
+
+        wget -P {{ role_path }}/files/ \
+          https://github.com/provectus/kafka-ui/releases/download/v{{ kafka_ui_version }}/{{ kafka_ui_jar_name }}
+
+      Страница релиза:
+        https://github.com/provectus/kafka-ui/releases/tag/v{{ kafka_ui_version }}
+  when: not _kafka_ui_local_jar.stat.exists
+  run_once: true
+
+- name: Assert at least one Kafka cluster is defined
+  ansible.builtin.assert:
+    that:
+      - kafka_ui_clusters is iterable
+      - kafka_ui_clusters | length > 0
+      - kafka_ui_clusters | map(attribute='name') | list | length == kafka_ui_clusters | length
+    fail_msg: >-
+      kafka_ui_clusters должен содержать хотя бы один кластер,
+      и у каждого кластера должен быть задан name.
+    quiet: true
+
+- name: Assert authentication settings are consistent
+  ansible.builtin.assert:
+    that:
+      - kafka_ui_auth_type in ['DISABLED', 'LOGIN_FORM', 'OAUTH2', 'LDAP']
+      - not (kafka_ui_auth_type == 'LOGIN_FORM' and (kafka_ui_admin_password | default('') | length) == 0)
+    fail_msg: >-
+      Для kafka_ui_auth_type=LOGIN_FORM обязательно задайте kafka_ui_admin_password
+      (лучше через ansible-vault). Допустимые типы: DISABLED, LOGIN_FORM, OAUTH2, LDAP.
+    quiet: true

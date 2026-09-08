@@ -1,0 +1,34 @@
+---
+- name: Create kafka-ui group
+  ansible.builtin.group:
+    name: "{{ kafka_ui_group }}"
+    system: true
+    state: present
+  when: kafka_ui_create_user | bool
+
+- name: Create kafka-ui system user
+  ansible.builtin.user:
+    name: "{{ kafka_ui_user }}"
+    group: "{{ kafka_ui_group }}"
+    home: "{{ kafka_ui_base_dir }}"
+    shell: "{{ kafka_ui_user_shell }}"
+    system: true
+    create_home: false
+    state: present
+  when: kafka_ui_create_user | bool
+
+- name: Create application directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ kafka_ui_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ kafka_ui_base_dir }}", mode: "0755" }
+    - { path: "{{ kafka_ui_lib_dir }}", mode: "0755" }
+    - { path: "{{ kafka_ui_conf_dir }}", mode: "{{ kafka_ui_conf_dir_mode }}" }
+    - { path: "{{ kafka_ui_log_dir }}", mode: "0750", owner: "{{ kafka_ui_user }}" }
+    - { path: "{{ kafka_ui_data_dir }}", mode: "0750", owner: "{{ kafka_ui_user }}" }
+  loop_control:
+    label: "{{ item.path }}"

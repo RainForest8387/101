@@ -1,0 +1,21 @@
+---
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: kafka-ui.service.j2
+    dest: "{{ _kafka_ui_unit_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart kafka-ui
+
+- name: Flush handlers before managing the service state
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start kafka-ui
+  ansible.builtin.systemd:
+    name: "{{ kafka_ui_service_name }}"
+    enabled: "{{ kafka_ui_service_enabled | bool }}"
+    state: "{{ kafka_ui_service_state }}"
+    daemon_reload: true

@@ -1,0 +1,38 @@
+---
+- name: Copy kafka-ui JAR from the role files/ directory
+  ansible.builtin.copy:
+    src: "{{ kafka_ui_jar_name }}"
+    dest: "{{ _kafka_ui_jar_dest }}"
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    mode: "0640"
+  notify: Restart kafka-ui
+
+- name: Get checksum of the deployed JAR
+  ansible.builtin.stat:
+    path: "{{ _kafka_ui_jar_dest }}"
+    checksum_algorithm: "{{ kafka_ui_jar_checksum.split(':')[0] }}"
+    get_checksum: true
+  register: _kafka_ui_remote_jar
+  when: (kafka_ui_jar_checksum | default('') | length) > 0
+
+- name: Assert the deployed JAR matches the expected checksum
+  ansible.builtin.assert:
+    that:
+      - _kafka_ui_remote_jar.stat.checksum == kafka_ui_jar_checksum.split(':')[1]
+    fail_msg: >-
+      Контрольная сумма {{ _kafka_ui_jar_dest }} не совпадает:
+      ожидалось {{ kafka_ui_jar_checksum.split(':')[1] }},
+      получено {{ _kafka_ui_remote_jar.stat.checksum | default('n/a') }}.
+    quiet: true
+  when: (kafka_ui_jar_checksum | default('') | length) > 0
+
+- name: Link the current kafka-ui JAR
+  ansible.builtin.file:
+    src: "{{ _kafka_ui_jar_dest }}"
+    dest: "{{ kafka_ui_jar_link }}"
+    state: link
+    owner: root
+    group: "{{ kafka_ui_group }}"
+    force: true
+  notify: Restart kafka-ui

@@ -1,0 +1,48 @@
+---
+- name: Install Java packages
+  ansible.builtin.apt:
+    name: "{{ kafka_ui_java_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: kafka_ui_java_install | bool
+  register: _kafka_ui_java_pkg
+  retries: 3
+  delay: 5
+  until: _kafka_ui_java_pkg is succeeded
+
+- name: Check that the Java binary exists
+  ansible.builtin.stat:
+    path: "{{ kafka_ui_java_bin }}"
+  register: _kafka_ui_java_stat
+
+- name: Fail when the Java binary is missing
+  ansible.builtin.fail:
+    msg: >-
+      Java не найдена по пути {{ kafka_ui_java_bin }}.
+      Установите JRE 17+ (kafka_ui_java_install=true) или укажите
+      правильный путь в kafka_ui_java_bin.
+  when: not _kafka_ui_java_stat.stat.exists
+
+- name: Get Java version
+  ansible.builtin.command: "{{ kafka_ui_java_bin }} -version"
+  register: _kafka_ui_java_raw
+  changed_when: false
+  check_mode: false
+
+- name: Set Java major version fact
+  ansible.builtin.set_fact:
+    _kafka_ui_java_major: >-
+      {{ ((_kafka_ui_java_raw.stderr | default('')) ~ (_kafka_ui_java_raw.stdout | default('')))
+         | regex_search('version "(\d+)', '\1') | first | default(0) | int }}
+
+- name: Assert Java version is supported by kafka-ui {{ kafka_ui_version }}
+  ansible.builtin.assert:
+    that:
+      - _kafka_ui_java_major | int >= kafka_ui_java_min_version | int
+    fail_msg: >-
+      kafka-ui {{ kafka_ui_version }} требует Java {{ kafka_ui_java_min_version }}+,
+      установлена Java {{ _kafka_ui_java_major }}
+      ({{ (_kafka_ui_java_raw.stderr | default('')) | trim | truncate(120) }}).
+    quiet: true
+  when: kafka_ui_java_version_check | bool

@@ -1,0 +1,26 @@
+---
+- name: Wait for the kafka-ui port to become available
+  ansible.builtin.wait_for:
+    host: "{{ kafka_ui_server_address if kafka_ui_server_address != '0.0.0.0' else '127.0.0.1' }}"
+    port: "{{ kafka_ui_server_port }}"
+    timeout: 120
+    delay: 3
+
+- name: Check the actuator health endpoint
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kafka_ui_server_port }}{{ kafka_ui_context_path }}/actuator/health"
+    method: GET
+    status_code: [200, 401]
+    return_content: true
+  register: _kafka_ui_health
+  retries: 12
+  delay: 5
+  until: _kafka_ui_health is succeeded
+  changed_when: false
+
+- name: Show kafka-ui health status
+  ansible.builtin.debug:
+    msg: >-
+      kafka-ui {{ kafka_ui_version }} доступен на
+      http://{{ ansible_facts['default_ipv4']['address'] | default(inventory_hostname) }}:{{ kafka_ui_server_port }}{{ kafka_ui_context_path }}
+      (health: {{ (_kafka_ui_health.json.status | default('protected by auth')) }})

@@ -1,0 +1,38 @@
+---
+- name: Deploy Kafka UI
+  hosts: kafka_ui
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: kfk-ui-role
+      vars:
+        kafka_ui_version: "0.7.2"
+        kafka_ui_server_port: 8080
+
+        # Доступ по логину/паролю (пароль храните в ansible-vault)
+        kafka_ui_auth_type: "LOGIN_FORM"
+        kafka_ui_admin_user: "admin"
+        kafka_ui_admin_password: "{{ vault_kafka_ui_admin_password }}"
+
+        kafka_ui_clusters:
+          - name: "prod"
+            bootstrapServers: "kfk-01:9092,kfk-02:9092,kfk-03:9092"
+            readOnly: false
+            schemaRegistry: "http://schema-registry:8081"
+            kafkaConnect:
+              - name: "connect"
+                address: "http://kfk-connect:8083"
+            metrics:
+              type: JMX
+              port: 9997
+
+          - name: "stage"
+            bootstrapServers: "kfk-stage:9092"
+            readOnly: true
+            properties:
+              security.protocol: SASL_PLAINTEXT
+              sasl.mechanism: SCRAM-SHA-512
+              sasl.jaas.config: >-
+                org.apache.kafka.common.security.scram.ScramLoginModule required
+                username="{{ vault_kafka_user }}" password="{{ vault_kafka_password }}";

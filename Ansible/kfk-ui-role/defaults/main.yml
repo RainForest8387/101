@@ -1,0 +1,129 @@
+---
+# ------------------------------------------------------------------------------
+# Версия и артефакт
+# ------------------------------------------------------------------------------
+# JAR скачивается ВРУЧНУЮ со страницы релиза и кладётся в files/ этой роли:
+#   https://github.com/provectus/kafka-ui/releases/tag/v0.7.2
+#   wget https://github.com/provectus/kafka-ui/releases/download/v0.7.2/kafka-ui-api-v0.7.2.jar
+kafka_ui_version: "0.7.2"
+kafka_ui_jar_name: "kafka-ui-api-v{{ kafka_ui_version }}.jar"
+
+# Необязательная проверка целостности локального файла в files/.
+# Формат: "sha256:<хеш>" (или sha1/md5). Пустая строка — проверка отключена.
+kafka_ui_jar_checksum: ""
+
+# ------------------------------------------------------------------------------
+# Пользователь и каталоги
+# ------------------------------------------------------------------------------
+kafka_ui_user: "kafka-ui"
+kafka_ui_group: "kafka-ui"
+kafka_ui_create_user: true
+kafka_ui_user_shell: "/usr/sbin/nologin"
+
+kafka_ui_base_dir: "/opt/kafka-ui"
+kafka_ui_lib_dir: "{{ kafka_ui_base_dir }}/lib"
+kafka_ui_conf_dir: "/etc/kafka-ui"
+kafka_ui_log_dir: "/var/log/kafka-ui"
+kafka_ui_data_dir: "/var/lib/kafka-ui"
+
+# Права на каталог с конфигурацией (там могут лежать пароли)
+kafka_ui_conf_dir_mode: "0750"
+kafka_ui_conf_file_mode: "0640"
+
+# Сколько версий JAR держать в lib_dir (старые не удаляются автоматически)
+kafka_ui_jar_link: "{{ kafka_ui_base_dir }}/kafka-ui.jar"
+
+# ------------------------------------------------------------------------------
+# Java
+# ------------------------------------------------------------------------------
+# kafka-ui 0.7.2 — Spring Boot 3, требуется Java 17+
+kafka_ui_java_install: true
+kafka_ui_java_packages:
+  - "openjdk-17-jre-headless"
+kafka_ui_java_bin: "/usr/bin/java"
+kafka_ui_java_min_version: 17
+kafka_ui_java_version_check: true
+
+# ------------------------------------------------------------------------------
+# Параметры запуска JVM
+# ------------------------------------------------------------------------------
+kafka_ui_heap_opts: "-Xms256m -Xmx1g"
+kafka_ui_java_opts:
+  - "-Djava.awt.headless=true"
+  - "-Dfile.encoding=UTF-8"
+  - "-XX:+UseG1GC"
+  - "-XX:+ExitOnOutOfMemoryError"
+
+# ------------------------------------------------------------------------------
+# HTTP-сервер
+# ------------------------------------------------------------------------------
+kafka_ui_server_port: 8080
+kafka_ui_server_address: "0.0.0.0"
+# Префикс пути, если приложение живёт за reverse proxy, например "/kafka-ui"
+kafka_ui_context_path: ""
+
+# ------------------------------------------------------------------------------
+# Кластеры Kafka
+# ------------------------------------------------------------------------------
+# Ключи задаются в нотации самого kafka-ui (camelCase) и попадают в
+# application.yml как есть — поддерживается любой параметр из документации.
+kafka_ui_clusters:
+  - name: "local"
+    bootstrapServers: "localhost:9092"
+    # readOnly: false
+    # schemaRegistry: "http://localhost:8081"
+    # kafkaConnect:
+    #   - name: "connect"
+    #     address: "http://localhost:8083"
+    # metrics:
+    #   type: JMX
+    #   port: 9997
+    # properties:
+    #   security.protocol: SASL_PLAINTEXT
+    #   sasl.mechanism: SCRAM-SHA-512
+    #   sasl.jaas.config: "{{ vault_kafka_jaas }}"
+
+# ------------------------------------------------------------------------------
+# Аутентификация
+# ------------------------------------------------------------------------------
+# DISABLED | LOGIN_FORM | OAUTH2 | LDAP
+kafka_ui_auth_type: "DISABLED"
+# Для LOGIN_FORM: встроенный пользователь Spring Security
+kafka_ui_admin_user: "admin"
+kafka_ui_admin_password: ""
+
+# Включить редактирование конфигурации из web-интерфейса
+kafka_ui_dynamic_config_enabled: false
+
+# Уровни логирования (logging.level.* в application.yml)
+kafka_ui_log_level_root: "INFO"
+kafka_ui_log_levels:
+  com.provectus: "INFO"
+
+# ------------------------------------------------------------------------------
+# Произвольные дополнения
+# ------------------------------------------------------------------------------
+# Рекурсивно сливается с сгенерированным application.yml (побеждает extra)
+kafka_ui_config_extra: {}
+# Дополнительные переменные окружения в EnvironmentFile юнита
+kafka_ui_env_extra: {}
+
+# ------------------------------------------------------------------------------
+# systemd
+# ------------------------------------------------------------------------------
+kafka_ui_service_name: "kafka-ui"
+kafka_ui_service_enabled: true
+kafka_ui_service_state: "started"
+kafka_ui_restart_sec: 10
+kafka_ui_nofile_limit: 65536
+# Опции изоляции systemd. На Astra Linux с включённым замкнутой программной
+# средой/PARSEC при проблемах со стартом можно выставить false.
+kafka_ui_systemd_hardening: true
+
+# ------------------------------------------------------------------------------
+# Прочее
+# ------------------------------------------------------------------------------
+# Открыть порт в ufw (если ufw установлен и используется)
+kafka_ui_manage_firewall: false
+# Скрывать содержимое шаблонов с секретами в выводе Ansible
+kafka_ui_no_log: false

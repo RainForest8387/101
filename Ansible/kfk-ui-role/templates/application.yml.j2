@@ -1,0 +1,4 @@
+# {{ ansible_managed }}
+# kafka-ui {{ kafka_ui_version }} — https://github.com/provectus/kafka-ui
+# Файл сгенерирован ролью kfk-ui-role, правки будут перезаписаны.
+{{ _kafka_ui_config | to_nice_yaml(indent=2, width=200) }}

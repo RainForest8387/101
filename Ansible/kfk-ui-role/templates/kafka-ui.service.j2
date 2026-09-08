@@ -1,0 +1,41 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Kafka UI {{ kafka_ui_version }} (provectus)
+Documentation=https://github.com/provectus/kafka-ui
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User={{ kafka_ui_user }}
+Group={{ kafka_ui_group }}
+WorkingDirectory={{ kafka_ui_base_dir }}
+EnvironmentFile=-{{ _kafka_ui_env_file }}
+ExecStart={{ kafka_ui_java_bin }} $JAVA_OPTS -jar {{ kafka_ui_jar_link }} --spring.config.additional-location=file:{{ _kafka_ui_conf_file }}
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec={{ kafka_ui_restart_sec }}
+TimeoutStopSec=30
+LimitNOFILE={{ kafka_ui_nofile_limit }}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ kafka_ui_service_name }}
+{% if kafka_ui_server_port | int < 1024 %}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+{% endif %}
+{% if kafka_ui_systemd_hardening | bool %}
+
+# --- изоляция ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths={{ kafka_ui_log_dir }} {{ kafka_ui_data_dir }}
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target

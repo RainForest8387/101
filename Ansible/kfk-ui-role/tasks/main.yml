@@ -1,0 +1,34 @@
+---
+- name: Preflight checks
+  ansible.builtin.include_tasks: preflight.yml
+  tags: ['kafka-ui', 'kafka-ui-preflight']
+
+- name: Install Java runtime
+  ansible.builtin.include_tasks: java.yml
+  tags: ['kafka-ui', 'kafka-ui-java']
+
+- name: Create service account and directories
+  ansible.builtin.include_tasks: user.yml
+  tags: ['kafka-ui', 'kafka-ui-install']
+
+- name: Deploy kafka-ui artifact
+  ansible.builtin.include_tasks: install.yml
+  tags: ['kafka-ui', 'kafka-ui-install']
+
+- name: Render configuration
+  ansible.builtin.include_tasks: config.yml
+  tags: ['kafka-ui', 'kafka-ui-config']
+
+- name: Configure systemd unit
+  ansible.builtin.include_tasks: service.yml
+  tags: ['kafka-ui', 'kafka-ui-service']
+
+- name: Open firewall port
+  ansible.builtin.include_tasks: firewall.yml
+  when: kafka_ui_manage_firewall | bool
+  tags: ['kafka-ui', 'kafka-ui-firewall']
+
+- name: Verify service availability
+  ansible.builtin.include_tasks: verify.yml
+  when: kafka_ui_service_state == 'started'
+  tags: ['kafka-ui', 'kafka-ui-verify']

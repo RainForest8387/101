@@ -1,0 +1,71 @@
+---
+# Внутренние переменные роли. Не переопределяйте их в inventory —
+# для расширения конфигурации используйте kafka_ui_config_extra.
+
+_kafka_ui_cfg_server: >-
+  {{
+    {
+      'server': {
+        'port': kafka_ui_server_port | int,
+        'address': kafka_ui_server_address
+      } | combine(
+        {'servlet': {'context-path': kafka_ui_context_path}}
+        if (kafka_ui_context_path | default('') | length) > 0 else {}
+      )
+    }
+  }}
+
+_kafka_ui_cfg_kafka: >-
+  {{ {'kafka': {'clusters': kafka_ui_clusters}} }}
+
+_kafka_ui_cfg_auth: >-
+  {{
+    {'auth': {'type': kafka_ui_auth_type}} | combine(
+      {
+        'spring': {
+          'security': {
+            'user': {
+              'name': kafka_ui_admin_user,
+              'password': kafka_ui_admin_password
+            }
+          }
+        }
+      }
+      if kafka_ui_auth_type == 'LOGIN_FORM' else {},
+      recursive=True
+    )
+  }}
+
+_kafka_ui_cfg_dynamic: >-
+  {{ {'dynamic': {'config': {'enabled': kafka_ui_dynamic_config_enabled | bool}}} }}
+
+_kafka_ui_cfg_logging: >-
+  {{
+    {
+      'logging': {
+        'level': {'root': kafka_ui_log_level_root} | combine(kafka_ui_log_levels | default({}, true))
+      },
+      'management': {
+        'endpoints': {'web': {'exposure': {'include': 'info,health'}}},
+        'endpoint': {'health': {'show-details': 'never'}}
+      }
+    }
+  }}
+
+# Итоговый application.yml
+_kafka_ui_config: >-
+  {{
+    _kafka_ui_cfg_server
+    | combine(_kafka_ui_cfg_kafka,
+              _kafka_ui_cfg_auth,
+              _kafka_ui_cfg_dynamic,
+              _kafka_ui_cfg_logging,
+              kafka_ui_config_extra | default({}, true),
+              recursive=True)
+  }}
+
+# Пути, вычисляемые из основных переменных
+_kafka_ui_jar_dest: "{{ kafka_ui_lib_dir }}/{{ kafka_ui_jar_name }}"
+_kafka_ui_conf_file: "{{ kafka_ui_conf_dir }}/application.yml"
+_kafka_ui_env_file: "{{ kafka_ui_conf_dir }}/kafka-ui.env"
+_kafka_ui_unit_file: "/etc/systemd/system/{{ kafka_ui_service_name }}.service"

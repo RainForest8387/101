@@ -1,0 +1,23 @@
+---
+galaxy_info:
+  role_name: kfk_ui
+  author: RainForest8387
+  description: >-
+    Установка Kafka UI (provectus) 0.7.2 из локально скачанного JAR
+    на Astra Linux / Debian с запуском под systemd.
+  license: MIT
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Debian
+      versions:
+        - buster
+        - bullseye
+        - bookworm
+  galaxy_tags:
+    - kafka
+    - kafkaui
+    - monitoring
+    - astra
+    - systemd
+
+dependencies: []

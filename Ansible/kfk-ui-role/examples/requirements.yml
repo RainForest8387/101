@@ -1,0 +1,4 @@
+---
+# Нужна только при kafka_ui_manage_firewall=true (модуль ufw)
+collections:
+  - name: community.general
