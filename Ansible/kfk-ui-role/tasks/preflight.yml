@@ -52,3 +52,65 @@
       Для kafka_ui_auth_type=LOGIN_FORM обязательно задайте kafka_ui_admin_password
       (лучше через ansible-vault). Допустимые типы: DISABLED, LOGIN_FORM, OAUTH2, LDAP.
     quiet: true
+
+- name: Assert Kafka security protocol is valid
+  ansible.builtin.assert:
+    that:
+      - kafka_ui_security_protocol in ['', 'PLAINTEXT', 'SSL', 'SASL_PLAINTEXT', 'SASL_SSL']
+    fail_msg: >-
+      kafka_ui_security_protocol должен быть одним из:
+      "" (не задавать), PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL.
+      Получено: {{ kafka_ui_security_protocol }}.
+    quiet: true
+
+- name: Assert SASL credentials are provided
+  ansible.builtin.assert:
+    that:
+      - (kafka_ui_sasl_jaas_config | default('') | length) > 0 or
+        ((kafka_ui_sasl_username | default('') | length) > 0 and
+         (kafka_ui_sasl_password | default('') | length) > 0)
+      - (kafka_ui_sasl_jaas_config | default('') | length) > 0 or
+        kafka_ui_sasl_mechanism | upper is match('^(SCRAM-SHA-(256|512)|PLAIN)$')
+    fail_msg: >-
+      При kafka_ui_security_protocol={{ kafka_ui_security_protocol }} задайте
+      kafka_ui_sasl_username/kafka_ui_sasl_password (храните в ansible-vault)
+      или готовую строку kafka_ui_sasl_jaas_config. Автоматически строка JAAS
+      собирается только для механизмов SCRAM-SHA-256, SCRAM-SHA-512 и PLAIN
+      (указан {{ kafka_ui_sasl_mechanism }}).
+    quiet: true
+  when: _kafka_ui_sasl_enabled | bool
+
+- name: Check that the truststore file is present in the role files/ directory
+  ansible.builtin.stat:
+    path: "{{ kafka_ui_ssl_truststore_src if kafka_ui_ssl_truststore_src.startswith('/')
+              else role_path ~ '/files/' ~ kafka_ui_ssl_truststore_src }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  check_mode: false
+  register: _kafka_ui_local_truststore
+  when:
+    - _kafka_ui_ssl_enabled | bool
+    - (kafka_ui_ssl_truststore_src | default('') | length) > 0
+
+- name: Fail when the truststore file is missing on the control node
+  ansible.builtin.fail:
+    msg: >-
+      Файл truststore "{{ kafka_ui_ssl_truststore_src }}" не найден.
+      Положите его в {{ role_path }}/files/ или укажите абсолютный путь
+      на управляющей машине в kafka_ui_ssl_truststore_src.
+  when:
+    - _kafka_ui_ssl_enabled | bool
+    - (kafka_ui_ssl_truststore_src | default('') | length) > 0
+    - not (_kafka_ui_local_truststore.stat.exists | default(false))
+  run_once: true
+
+- name: Warn when TLS is enabled without a custom truststore
+  ansible.builtin.debug:
+    msg: >-
+      kafka_ui_ssl_truststore_src и kafka_ui_ssl_truststore_path не заданы —
+      сертификат брокеров будет проверяться по системному хранилищу JRE
+      (cacerts). Для самоподписанного CA укажите truststore.
+  when:
+    - _kafka_ui_ssl_enabled | bool
+    - (_kafka_ui_truststore_dest | length) == 0

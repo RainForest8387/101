@@ -1,4 +1,21 @@
 ---
+- name: Reset the effective cluster list
+  ansible.builtin.set_fact:
+    _kafka_ui_clusters_effective: []
+
+- name: Merge Kafka security settings into every cluster
+  ansible.builtin.set_fact:
+    _kafka_ui_clusters_effective: >-
+      {{ _kafka_ui_clusters_effective + [
+           ({'properties': _kafka_ui_security_properties}
+            if (_kafka_ui_security_properties | length) > 0 else {})
+           | combine(item, recursive=True)
+         ] }}
+  loop: "{{ kafka_ui_clusters }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ kafka_ui_no_log | bool }}"
+
 - name: Render application.yml
   ansible.builtin.template:
     src: application.yml.j2

@@ -1,38 +1,27 @@
 ---
+# Параметры вынесены в group_vars/kafka_ui/:
+#   main.yml  — открытые настройки
+#   vault.yml — пароли (ansible-vault), см. vault.yml.example
+#
+#   ansible-playbook -i inventory.ini playbook.yml --ask-vault-pass
+#
 - name: Deploy Kafka UI
   hosts: kafka_ui
   become: true
   gather_facts: true
 
+  pre_tasks:
+    - name: Assert that vault variables are available
+      ansible.builtin.assert:
+        that:
+          - vault_kafka_sasl_password is defined
+          - vault_kafka_truststore_password is defined
+        fail_msg: >-
+          Не найдены переменные из vault. Запустите плейбук с
+          --ask-vault-pass или --vault-password-file и убедитесь, что
+          group_vars/kafka_ui/vault.yml существует и расшифровывается.
+        quiet: true
+      tags: ['always']
+
   roles:
     - role: kfk-ui-role
-      vars:
-        kafka_ui_version: "0.7.2"
-        kafka_ui_server_port: 8080
-
-        # Доступ по логину/паролю (пароль храните в ansible-vault)
-        kafka_ui_auth_type: "LOGIN_FORM"
-        kafka_ui_admin_user: "admin"
-        kafka_ui_admin_password: "{{ vault_kafka_ui_admin_password }}"
-
-        kafka_ui_clusters:
-          - name: "prod"
-            bootstrapServers: "kfk-01:9092,kfk-02:9092,kfk-03:9092"
-            readOnly: false
-            schemaRegistry: "http://schema-registry:8081"
-            kafkaConnect:
-              - name: "connect"
-                address: "http://kfk-connect:8083"
-            metrics:
-              type: JMX
-              port: 9997
-
-          - name: "stage"
-            bootstrapServers: "kfk-stage:9092"
-            readOnly: true
-            properties:
-              security.protocol: SASL_PLAINTEXT
-              sasl.mechanism: SCRAM-SHA-512
-              sasl.jaas.config: >-
-                org.apache.kafka.common.security.scram.ScramLoginModule required
-                username="{{ vault_kafka_user }}" password="{{ vault_kafka_password }}";

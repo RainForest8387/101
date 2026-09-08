@@ -69,19 +69,52 @@ kafka_ui_context_path: ""
 # application.yml как есть — поддерживается любой параметр из документации.
 kafka_ui_clusters:
   - name: "local"
-    bootstrapServers: "localhost:9092"
+    bootstrapServers: "localhost:9094"
     # readOnly: false
-    # schemaRegistry: "http://localhost:8081"
+    # schemaRegistry: "https://localhost:8081"
     # kafkaConnect:
     #   - name: "connect"
-    #     address: "http://localhost:8083"
+    #     address: "https://localhost:8083"
     # metrics:
     #   type: JMX
     #   port: 9997
-    # properties:
-    #   security.protocol: SASL_PLAINTEXT
-    #   sasl.mechanism: SCRAM-SHA-512
-    #   sasl.jaas.config: "{{ vault_kafka_jaas }}"
+    # properties:            # переопределяет общие настройки безопасности ниже
+    #   security.protocol: PLAINTEXT
+
+# ------------------------------------------------------------------------------
+# Подключение к Kafka: SASL_SSL + SCRAM-SHA-256, брокеры слушают порт 9094
+# ------------------------------------------------------------------------------
+# Эти параметры подставляются в properties КАЖДОГО кластера из kafka_ui_clusters.
+# Собственные properties кластера имеют приоритет над ними.
+# "" в kafka_ui_security_protocol полностью отключает блок (PLAINTEXT).
+kafka_ui_security_protocol: "SASL_SSL"
+kafka_ui_sasl_mechanism: "SCRAM-SHA-256"
+kafka_ui_sasl_username: ""
+kafka_ui_sasl_password: ""
+# Готовая строка JAAS. Если пусто — собирается из username/password
+# (ScramLoginModule для SCRAM-*, PlainLoginModule для PLAIN).
+kafka_ui_sasl_jaas_config: ""
+
+# --- TLS ---
+kafka_ui_ssl_dir: "{{ kafka_ui_conf_dir }}/ssl"
+# Truststore с CA, подписавшим сертификаты брокеров.
+# Имя файла в files/ роли (например "kafka.truststore.jks") либо абсолютный
+# путь на управляющей машине — файл будет скопирован в kafka_ui_ssl_dir.
+kafka_ui_ssl_truststore_src: ""
+# Либо путь к truststore, который уже лежит на целевом хосте.
+# Если обе переменные пустые — используется системный cacerts JRE.
+kafka_ui_ssl_truststore_path: ""
+kafka_ui_ssl_truststore_password: ""
+kafka_ui_ssl_truststore_type: "JKS"     # JKS | PKCS12
+# "" отключает проверку соответствия hostname сертификату брокера
+kafka_ui_ssl_endpoint_identification_algorithm: "https"
+
+# Клиентский сертификат (mTLS). При SCRAM-аутентификации обычно не нужен.
+kafka_ui_ssl_keystore_src: ""
+kafka_ui_ssl_keystore_path: ""
+kafka_ui_ssl_keystore_password: ""
+kafka_ui_ssl_keystore_type: "JKS"
+kafka_ui_ssl_key_password: ""
 
 # ------------------------------------------------------------------------------
 # Аутентификация

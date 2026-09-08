@@ -16,7 +16,7 @@ _kafka_ui_cfg_server: >-
   }}
 
 _kafka_ui_cfg_kafka: >-
-  {{ {'kafka': {'clusters': kafka_ui_clusters}} }}
+  {{ {'kafka': {'clusters': _kafka_ui_clusters_effective}} }}
 
 _kafka_ui_cfg_auth: >-
   {{
@@ -51,6 +51,66 @@ _kafka_ui_cfg_logging: >-
       }
     }
   }}
+
+# ------------------------------------------------------------------------------
+# Параметры безопасности подключения к Kafka (SASL_SSL / SCRAM-SHA-256)
+# ------------------------------------------------------------------------------
+# Путь к truststore на целевом хосте: либо скопированный из files/, либо
+# заранее размещённый администратором.
+_kafka_ui_truststore_dest: >-
+  {{ (kafka_ui_ssl_dir ~ '/' ~ (kafka_ui_ssl_truststore_src | basename))
+     if (kafka_ui_ssl_truststore_src | default('') | length) > 0
+     else (kafka_ui_ssl_truststore_path | default('')) }}
+
+_kafka_ui_keystore_dest: >-
+  {{ (kafka_ui_ssl_dir ~ '/' ~ (kafka_ui_ssl_keystore_src | basename))
+     if (kafka_ui_ssl_keystore_src | default('') | length) > 0
+     else (kafka_ui_ssl_keystore_path | default('')) }}
+
+_kafka_ui_sasl_login_module: >-
+  {{ 'org.apache.kafka.common.security.scram.ScramLoginModule'
+     if kafka_ui_sasl_mechanism.upper().startswith('SCRAM')
+     else 'org.apache.kafka.common.security.plain.PlainLoginModule' }}
+
+_kafka_ui_jaas_config: >-
+  {{ kafka_ui_sasl_jaas_config
+     if (kafka_ui_sasl_jaas_config | default('') | length) > 0
+     else (_kafka_ui_sasl_login_module ~ ' required username="' ~ kafka_ui_sasl_username
+           ~ '" password="' ~ kafka_ui_sasl_password ~ '";') }}
+
+_kafka_ui_sasl_enabled: "{{ 'SASL' in (kafka_ui_security_protocol | default('') | upper) }}"
+_kafka_ui_ssl_enabled: "{{ 'SSL' in (kafka_ui_security_protocol | default('') | upper) }}"
+
+# properties, которые подмешиваются в каждый кластер
+_kafka_ui_security_properties: >-
+  {{
+    ({'security.protocol': kafka_ui_security_protocol}
+     if (kafka_ui_security_protocol | default('') | length) > 0 else {})
+    | combine({'sasl.mechanism': kafka_ui_sasl_mechanism,
+               'sasl.jaas.config': _kafka_ui_jaas_config}
+              if _kafka_ui_sasl_enabled | bool else {})
+    | combine({'ssl.endpoint.identification.algorithm': kafka_ui_ssl_endpoint_identification_algorithm}
+              if _kafka_ui_ssl_enabled | bool else {})
+    | combine({'ssl.truststore.location': _kafka_ui_truststore_dest,
+               'ssl.truststore.type': kafka_ui_ssl_truststore_type}
+              if (_kafka_ui_ssl_enabled | bool and (_kafka_ui_truststore_dest | length) > 0) else {})
+    | combine({'ssl.truststore.password': kafka_ui_ssl_truststore_password}
+              if (_kafka_ui_ssl_enabled | bool
+                  and (_kafka_ui_truststore_dest | length) > 0
+                  and (kafka_ui_ssl_truststore_password | default('') | length) > 0) else {})
+    | combine({'ssl.keystore.location': _kafka_ui_keystore_dest,
+               'ssl.keystore.type': kafka_ui_ssl_keystore_type,
+               'ssl.keystore.password': kafka_ui_ssl_keystore_password}
+              if (_kafka_ui_ssl_enabled | bool and (_kafka_ui_keystore_dest | length) > 0) else {})
+    | combine({'ssl.key.password': kafka_ui_ssl_key_password}
+              if (_kafka_ui_ssl_enabled | bool
+                  and (_kafka_ui_keystore_dest | length) > 0
+                  and (kafka_ui_ssl_key_password | default('') | length) > 0) else {})
+  }}
+
+# Кластеры с подмешанными настройками безопасности.
+# Формируется в tasks/config.yml (set_fact), т.к. properties самого кластера
+# должны перекрывать общие параметры.
 
 # Итоговый application.yml
 _kafka_ui_config: >-

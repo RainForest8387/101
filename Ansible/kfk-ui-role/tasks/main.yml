@@ -15,6 +15,11 @@
   ansible.builtin.include_tasks: install.yml
   tags: ['kafka-ui', 'kafka-ui-install']
 
+- name: Deploy Kafka TLS stores
+  ansible.builtin.include_tasks: ssl.yml
+  when: _kafka_ui_ssl_enabled | bool
+  tags: ['kafka-ui', 'kafka-ui-config', 'kafka-ui-ssl']
+
 - name: Render configuration
   ansible.builtin.include_tasks: config.yml
   tags: ['kafka-ui', 'kafka-ui-config']
