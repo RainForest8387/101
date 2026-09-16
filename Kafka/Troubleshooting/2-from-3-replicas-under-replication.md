@@ -275,3 +275,58 @@ grep -h -A3 "Error for partition __consumer_offsets-16" /kafka/kafka/logs/server
 Generation 38379200 — огромное значение. Даже при ребалансе раз в секунду до него пришлось бы идти больше года. Скорее всего, UserAuditJournal.Prod постоянно ребалансировалась задолго до этого инцидента: частые рестарты, превышение max.poll.interval.ms, короткий session.timeout.ms на rdkafka-клиентах. Каждый ребаланс пишет метаданные группы как раз в партицию 16. К выпадению реплик это напрямую, скорее всего, не относится, но проверить стоит отдельно, когда закроете инцидент.
 
 Пришлите стектрейс с брокера 4 и строки Shrinking ISR с брокера 1. По ним будет понятно, чинить ли лог лидера или достаточно пересоздать реплики.
+
+
+
+Значение 2 задано в двух местах: на самом топике (DYNAMIC_TOPIC_CONFIG) и в server.properties брокеров (STATIC_BROKER_CONFIG). Настройка топика приоритетнее брокерской, поэтому достаточно поменять её, server.properties трогать и перезапускать брокеры не нужно.
+
+Снизить до 1
+```bash
+kafka-configs.sh --bootstrap-server $brokers --command-config $config --alter \
+  --entity-type topics --entity-name __consumer_offsets \
+  --add-config min.insync.replicas=1
+```
+Проверьте, что значение применилось. Первым в synonyms должно стоять DYNAMIC_TOPIC_CONFIG:min.insync.replicas=1:
+
+```bash
+kafka-configs.sh --bootstrap-server $brokers --command-config $config --describe --all \
+  --entity-type topics --entity-name __consumer_offsets | grep min.insync
+```
+
+Брокер подхватывает новое значение через несколько секунд. Убедитесь на брокере 1, что ошибки прекратились и группы стабилизировались:
+
+```bash
+# в текущем логе не должно появляться новых NotEnoughReplicasException по партиции 16
+tail -f /kafka/kafka/logs/server.log | grep -E "__consumer_offsets-16|UserAuditJournal.Prod"
+
+kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config \
+  --describe --group UserAuditJournal.Prod --state
+# ожидаемо: STATE = Stable
+```
+Вернуть после восстановления ISR
+
+Раньше значение было явно задано на топике, поэтому возвращайте его так же явно, а не удалением:
+
+```bash
+kafka-configs.sh --bootstrap-server $brokers --command-config $config --alter \
+  --entity-type topics --entity-name __consumer_offsets \
+  --add-config min.insync.replicas=2
+```
+Делайте это только после того, как --describe --under-replicated-partitions по __consumer_offsets вернёт пустой вывод. Если вернуть раньше, группы снова уйдут в цикл ребалансов.
+
+Дальше
+
+Когда группы оживут, сделайте бэкап офсетов групп партиции 16 (из предыдущего ответа, не забудьте добавить --command-config $config) и пришлите два фрагмента.
+
+Стектрейс ошибки с брокера 4 и проверка, повторяется ли она сейчас:
+
+```bash
+grep -h -A3 "Error for partition __consumer_offsets-16" /kafka/kafka/logs/server.log* | head -8
+grep -h "Error for partition __consumer_offsets-16" /kafka/kafka/logs/server.log* | tail -2
+```
+Хронология выпадения реплик с брокера 1:
+
+```bash
+grep -h "Shrinking ISR" /kafka/kafka/logs/server.log* | grep "__consumer_offsets-16"
+```
+Сейчас важнее всего тип исключения из первой команды: от него зависит, чинить ли лог на лидере или достаточно пересоздать реплики на 2 и 4.
