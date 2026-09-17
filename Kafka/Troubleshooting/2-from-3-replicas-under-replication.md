@@ -882,3 +882,83 @@ lsblk -o NAME,TYPE,SIZE,MODEL,ROTA /dev/sdc; df -hT /kafka/data/kafka
 df /kafka/repair_p16 /kafka/corrupt_backup 2>/dev/null
 ```
 Если это тот же раздел, перенесите каталог на другой том или на другой хост.
+
+
+
+Дополнеие:
+Скрипты для проверки сегментов
+
+Ниже два скрипта. holes.py работает за секунды по метаданным файлов и находит разреженные дыры вроде вашей. scan_segments.py читает заголовки батчей и находит нули и мусор даже в выделенных блоках. Запускайте оба: первый быстрый, второй тщательнее.
+
+/tmp/scan_segments.py
+```bash
+cat > /tmp/scan_segments.py <<'EOF'
+#!/usr/bin/env python3
+import sys, os, mmap, struct, datetime
+
+def ts(ms):
+    return datetime.datetime.fromtimestamp(ms/1000).strftime('%Y-%m-%d %H:%M:%S') if ms > 0 else '?'
+
+def scan(path):
+    if os.path.getsize(path) == 0:
+        return None
+    with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        size, pos, prev, prev_ts = len(mm), 0, -1, -1
+        while pos + 17 <= size:
+            off, length = struct.unpack_from('>qi', mm, pos)
+            magic = mm[pos + 16]
+            last = f"последний целый батч baseOffset={prev}, время={ts(prev_ts)}"
+            if length < 14:
+                return f"pos={pos}: size={length} (нули/мусор); {last}"
+            if magic > 2:
+                return f"pos={pos}: magic={magic} (мусор); {last}"
+            if off < prev:
+                return f"pos={pos}: offset {off} < предыдущего {prev}; {last}"
+            end = pos + 12 + length
+            if end > size:
+                return f"pos={pos}: батч обрезан (нужно до {end}, в файле {size}); {last}"
+            if magic == 2 and pos + 43 <= size:
+                prev_ts = struct.unpack_from('>q', mm, pos + 35)[0]
+            prev, pos = off, end
+        if pos != size:
+            return f"после последнего батча лишние {size - pos} байт"
+    return None
+
+paths = [l.strip() for l in sys.stdin if l.strip()]
+bad = 0
+for i, p in enumerate(paths, 1):
+    try:
+        r = scan(p)
+    except Exception as e:
+        r = f"ошибка чтения: {e}"
+    if r:
+        bad += 1
+        print(f"BAD {p}: {r}", flush=True)
+    if i % 200 == 0:
+        print(f"[{i}/{len(paths)}]", file=sys.stderr, flush=True)
+print(f"проверено {len(paths)}, с проблемами {bad}", file=sys.stderr)
+EOF
+```
+/tmp/holes.py
+```bash
+cat > /tmp/holes.py <<'EOF'
+#!/usr/bin/env python3
+import os, sys
+bad = 0
+for p in (l.strip() for l in sys.stdin):
+    if not p: continue
+    try:
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            h = os.lseek(fd, 0, os.SEEK_HOLE)
+            if h < size:
+                try: d = os.lseek(fd, h, os.SEEK_DATA)
+                except OSError: d = size
+                bad += 1; print(f"HOLE {p}: {h}..{d} ({(d-h)/1048576:.2f} МиБ), size {size}")
+        finally: os.close(fd)
+    except OSError as e:
+        print(f"ERR {p}: {e}")
+print(f"файлов с дырами: {bad}", file=sys.stderr)
+EOF
+```
