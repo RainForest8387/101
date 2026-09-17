@@ -801,3 +801,84 @@ grep -hiE "uncleanable|corrupt|error" /kafka/kafka/logs/log-cleaner.log | tail
 Не удалять каталоги партиции 16 на брокерах 2 и 4: это копии для отката.
 Не включать unclean.leader.election.enable глобально. Точечный kafka-leader-election --election-type unclean нужен только при откате.
 Не возвращать min.insync.replicas=2, пока ISR партиции 16 не полный.
+
+
+
+
+брокер1 
+syslog-14092026
+```bash
+Sep 13 15:56:50 1 kernel: EXT4-fs (sdc): Delayed block allocation failed for inode 109576911 at logical offset 18432 with max blocks 1 with error 117
+Sep 13 15:56:50 1 kernel: EXT4-fs (sdc): This should not happen!! Data will be lost
+
+Sep 13 15:56:50 1 sh[3114246]: [2026-09-13 15:56:50,768] ERROR [ReplicaManager broker=1] Error processing fetch with max size 1048576 from replica [2] on partition yqswEkTuQOSXTLMyJf8ntQ:__consumer_offsets-16: PartitionData(topicId=yqswEkTuQOSXTLMyJf8ntQ, fetchOffset=2063764, logStartOffset=0, maxBytes=1048576, currentLeaderEpoch=Optional[91], lastFetchedEpoch=Optional[91]) (kafka.server.ReplicaManager)
+Sep 13 15:56:50 1 sh[3114246]: org.apache.kafka.common.errors.CorruptRecordException: Found record size 0 smaller than minimum record overhead (14) in file /kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log.
+Sep 13 15:56:50 1 sh[3114246]: [2026-09-13 15:56:50,769] ERROR [ReplicaManager broker=1] Error processing fetch with max size 1048576 from replica [4] on partition yqswEkTuQOSXTLMyJf8ntQ:__consumer_offsets-16: PartitionData(topicId=yqswEkTuQOSXTLMyJf8ntQ, fetchOffset=2063764, logStartOffset=0, maxBytes=1048576, currentLeaderEpoch=Optional[91], lastFetchedEpoch=Optional[91]) (kafka.server.ReplicaManager)
+Sep 13 15:56:50 1 sh[3114246]: org.apache.kafka.common.errors.CorruptRecordException: Found record size 0 smaller than minimum record overhead (14) in file /kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log.
+Sep 13 15:56:50 1 systemd[1]: Starting Auditbeat Watchdog Service...
+Sep 13 15:56:50 1 systemd[1]: auditbeat-watchdog.service: Succeeded.
+Sep 13 15:56:50 1 systemd[1]: Started Auditbeat Watchdog Service.
+Sep 13 15:56:50 1 systemd[1]: auditbeat-watchdog.service: Consumed 54ms CPU time.
+Sep 13 15:56:51 1 sh[3114246]: [2026-09-13 15:56:51,779] ERROR [ReplicaManager broker=1] Error processing fetch with max size 1048576 from replica [4] on partition yqswEkTuQOSXTLMyJf8ntQ:__consumer_offsets-16: PartitionData(topicId=yqswEkTuQOSXTLMyJf8ntQ, fetchOffset=2063764, logStartOffset=0, maxBytes=1048576, currentLeaderEpoch=Optional[91], lastFetchedEpoch=Optional[91]) (kafka.server.ReplicaManager)
+Sep 13 15:56:51 1 sh[3114246]: org.apache.kafka.common.errors.CorruptRecordException: Found record size 0 smaller than minimum record overhead (14) in file /kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log.
+Sep 13 15:56:51 1 sh[3114246]: [2026-09-13 15:56:51,849] ERROR [ReplicaManager broker=1] Error processing fetch with max size 1048576 from replica [2] on partition yqswEkTuQOSXTLMyJf8ntQ:__consumer_offsets-16: PartitionData(topicId=yqswEkTuQOSXTLMyJf8ntQ, fetchOffset=2063764, logStartOffset=0, maxBytes=1048576, currentLeaderEpoch=Optional[91], lastFetchedEpoch=Optional[91]) (kafka.server.ReplicaManager)
+Sep 13 15:56:51 1 sh[3114246]: org.apache.kafka.common.errors.CorruptRecordException: Found record size 0 smaller than minimum record overhead (14) in file /kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log
+```
+Причина найдена: повреждение метаданных ext4 на sdc
+```bash
+EXT4-fs (sdc): Delayed block allocation failed for inode 109576911
+               at logical offset 18432 with max blocks 1 with error 117
+EXT4-fs (sdc): This should not happen!! Data will be lost
+```
+Всё сходится до байта: логический блок 18432 × 4096 = 75497472, ровно начало дыры. Kafka выдала первую CorruptRecordException через доли секунды после этой строки ядра.
+
+Ошибка 117 — это EUCLEAN, «structure needs cleaning». Здесь важно, чего в сообщении нет: это не ошибка ввода-вывода (EIO, 5) и не нехватка места (ENOSPC, 28). Диск и СХД отработали штатно. EUCLEAN означает, что сам ext4 при выделении блоков обнаружил несогласованность своих метаданных — обычно расхождение битмапа блоков с дескриптором группы или неверную контрольную сумму. Выделить блоки для грязных страниц ФС не смогла, страницы выбросила, о чём честно написала «Data will be lost».
+
+Отсюда три следствия:
+
+Файловая система на sdc повреждена, и повреждение никуда не делось. Kafka продолжает писать на неё третьи сутки. Эпизод 12.09 на брокере 2 (offset 1499375) — почти наверняка первое проявление той же проблемы.
+Починки одного файла недостаточно. Нужен offline-e2fsck. Без него дыра может появиться снова в любом файле, в том числе в уже исправленном.
+План меняется: e2fsck требует размонтировать log.dirs, то есть выполняется в том же окне, но до замены сегмента. Иначе fsck может задеть только что подложенный файл.
+Шаг 0. Диагностика прямо сейчас (безопасно, брокер работает)
+
+Счётчик ошибок ФС в суперблоке. Это главное: покажет, сколько раз и когда ошибки были, в том числе до 13.09.
+
+```bash
+sudo dumpe2fs -h /dev/sdc 2>/dev/null | grep -iE "state|error|mount count|check|created|features"
+```
+Обратите внимание на Filesystem state (ожидается clean with errors), FS Error count, First error time, First error function, First error inode #, Last error time.
+
+Была ли ФС переведена в read-only и с какими опциями смонтирована
+
+```bash
+grep -E "sdc|/kafka" /proc/mounts /etc/fstab
+```
+Если стоит errors=continue или errors=remount-ro не сработал, брокер продолжал писать поверх повреждённой ФС.
+
+Первопричинное сообщение ядра. Строка про delayed allocation — следствие. Настоящая ошибка (bitmap and bg descriptor inconsistent, checksum does not match, ext4_lookup: comm ...) обычно появляется раньше:
+
+```bash
+sudo zgrep -hiE "EXT4-fs (error|warning)|bg descriptor|bitmap|checksum|htree|inode" /var/log/syslog* \
+  | grep -i sdc | sort -u | head -40
+sudo zgrep -hi "EXT4" /var/log/syslog* | grep "Sep 12" | head -20
+```
+Тот ли это inode
+
+```bash
+stat -c '%i %n' /kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log   # 109576911
+sudo find /kafka/data/kafka -inum 109576911
+```
+Здоровье самого диска. Ожидаемо чистое (ошибка не про I/O), но исключить стоит:
+
+```bash
+sudo smartctl -a /dev/sdc | grep -iE "result|reallocated|pending|uncorrect|error count"
+lsblk -o NAME,TYPE,SIZE,MODEL,ROTA /dev/sdc; df -hT /kafka/data/kafka
+```
+Если это виртуалка, спросите у инфраструктуры, не было ли 12–13 сентября снапшота, миграции, расширения диска или сбоя на СХД.
+
+Где лежит рабочая копия исправленного файла. Она не должна быть на sdc, иначе fsck может её задеть:
+
+```bash
+df /kafka/repair_p16 /kafka/corrupt_backup 2>/dev/null
+```
+Если это тот же раздел, перенесите каталог на другой том или на другой хост.
