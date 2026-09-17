@@ -491,3 +491,313 @@ dmesg -T | grep -iE "i/o error|medium error|blk_update_request|xfs|ext4" | tail
 Спросите у команды инфраструктуры, не было ли в это время миграции ВМ, снапшота или проблем на СХД. Пока диск брокера 1 под подозрением, лучше не делать его лидером новых партиций.
 
 Если на каком-то шаге вывод не совпадёт с ожидаемым, особенно на 9 и 11, остановитесь и пришлите его сюда.
+
+
+
+## План починки __consumer_offsets-16
+Суть
+**Что сломано.** На брокере 1 (лидер, единственный в ISR) в сегменте 00000000000001539455.log ФС потеряла около 8 МиБ данных. Байты 75497472…83945495 читаются как нули. Это offset'ы 2063764…2122407, запись 13.09 около 15:56:47.
+**Что цело**  Всё до дыры есть на всех трёх брокерах. Всё после дыры (с 2122408 до конца) есть только на брокере 1.
+**Как чиним.** Вырезаем дыру из файла и перезапускаем брокер 1 один раз. Для compacted-топика пропуск в offset'ах допустим. Брокер 1 остаётся лидером со всеми уцелевшими данными, фолловеры 2 и 4 догоняют его.
+**Что теряем.** Только то, что уже потеряно: около 58,6 тыс. записей.
+**Простой.** Партиция 16 недоступна, пока перезапускается брокер 1.
+**Запасной вариант.** Unclean election на брокер 4 и восстановление офсетов из бэкапа.
+
+Во всех командах используются $brokers и $config
+
+**Этап 0.** Подготовка (без простоя, всё только на чтение)
+**0.1.** Хранилище брокера 1
+
+Если дыра появилась из-за нехватки места на thin-томе или ошибки хранилища, запись исправленного файла может сломаться так же. Поэтому сначала проверьте хранилище:
+
+```bash
+df -hT /kafka/data/kafka
+lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT
+sudo lvs -a -o+data_percent,metadata_percent 2>/dev/null
+journalctl -k --since "2026-09-13 15:55:30" --until "2026-09-13 15:58:00" --no-pager
+journalctl -k --since "2026-09-12" --no-pager \
+  | grep -iE "page discard|writeback|lost async page write|buffer i/o|no space|thin|xfs|ext4" | tail -30
+```
+
+Если нашлись ошибки writeback или заполненный thin pool, передайте это инфраструктуре и устраните до окна работ.
+
+**0.2.** Поиск дыр во всех сегментах, на каждом брокере (1, 2, 4)
+```bash
+cat > /tmp/holes.py <<'EOF'
+import os, sys
+bad = 0
+for p in (l.strip() for l in sys.stdin):
+    if not p: continue
+    try:
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            h = os.lseek(fd, 0, os.SEEK_HOLE)
+            if h < size:
+                try: d = os.lseek(fd, h, os.SEEK_DATA)
+                except OSError: d = size
+                bad += 1; print(f"HOLE {p}: {h}..{d} ({(d-h)/1048576:.2f} МиБ), size {size}")
+        finally: os.close(fd)
+    except OSError as e:
+        print(f"ERR {p}: {e}")
+print(f"файлов с дырами: {bad}", file=sys.stderr)
+EOF
+
+find /kafka/data/kafka -name '*.log' -size +0 | python3 /tmp/holes.py
+```
+
+Ожидаемый результат: на брокере 1 только __consumer_offsets-16/00000000000001539455.log, на брокерах 2 и 4 ни одного файла. Если нашлось что-то ещё, остановитесь и пришлите вывод.
+
+**0.3.** Копии партиции 16 на брокерах 2 и 4 (нужны для отката)
+
+Выполните на брокерах 2 и 4. Скрипт /tmp/scan_segments.py берётся из предыдущих ответов (версия со временем батча):
+
+```bash
+ls /kafka/data/kafka/__consumer_offsets-16/*.log | python3 /tmp/scan_segments.py   # «с проблемами 0»
+kafka-dump-log.sh --files $(ls /kafka/data/kafka/__consumer_offsets-16/*.log | tail -1) 2>&1 \
+  | grep baseOffset | tail -1                                                        # lastOffset 2063763
+```
+**0.4.** Список групп партиции 16
+```bash
+kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config --list > groups.txt
+
+python3 - > groups16.txt <<'EOF'
+def jhash(s):
+    b = s.encode('utf-16-be'); h = 0
+    for i in range(0, len(b), 2):
+        h = (31*h + int.from_bytes(b[i:i+2], 'big')) & 0xFFFFFFFF
+    return h
+for line in open('groups.txt'):
+    g = line.rstrip('\n')
+    if g and (jhash(g) & 0x7FFFFFFF) % 50 == 16:
+        print(g)
+EOF
+
+wc -l groups16.txt
+grep -x "UserAuditJournal.Prod" groups16.txt     # должна быть в списке
+```
+
+Определите владельцев этих групп и договоритесь, что на время окна их консьюмеры будут остановлены.
+
+**0.5.** Функция бэкапа офсетов и предварительный бэкап
+```bash
+backup_offsets() {
+  BK=$1; mkdir -p "$BK"
+  while read -r g; do
+    kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config \
+      --describe --group "$g" --offsets 2>"$BK/$g.err" \
+      | awk 'NF>=4 && $4 ~ /^[0-9]+$/ {print $2","$3","$4}' > "$BK/$g.csv"
+  done < groups16.txt
+  echo "пустых csv: $(find "$BK" -name '*.csv' -empty | wc -l)"
+  cat "$BK"/*.err | sort -u | head
+}
+
+backup_offsets offsets_pre_$(date +%F_%H%M)
+```
+
+Если в .err есть ошибки, разберитесь с ними до окна.
+
+**0.6.** Исправленная копия сегмента и её проверка (брокер 1)
+
+Рабочий каталог создавайте вне /kafka/data/kafka:
+
+```bash
+S=/kafka/data/kafka/__consumer_offsets-16/00000000000001539455.log
+W=/kafka/repair_p16; mkdir -p $W
+
+sha256sum $S | tee $W/orig.sha256              # отпечаток исходника, сверим в окне
+
+head -c 75497472 $S >  $W/00000000000001539455.log
+tail -c +83945497 $S >> $W/00000000000001539455.log
+stat -c %s $W/00000000000001539455.log         # 96409440
+
+echo $W/00000000000001539455.log | python3 /tmp/scan_segments.py      # «с проблемами 0»
+
+kafka-dump-log.sh --files $W/00000000000001539455.log > $W/dump.txt 2>&1
+grep -ciE "exception|isvalid: false" $W/dump.txt                       # 0
+grep -E "baseOffset: (2063742|2122408) " $W/dump.txt                   # стык: 2063742 (lastOffset 2063763) → 2122408
+tail -2 $W/dump.txt                                                    # lastOffset 2267629
+
+ls -l /kafka/data/kafka/__consumer_offsets-16/                         # следующий сегмент: 00000000000002267630.log
+cat /kafka/data/kafka/__consumer_offsets-16/leader-epoch-checkpoint
+```
+В leader-epoch-checkpoint ни одна эпоха не должна начинаться в диапазоне 2063764…2122407. CreateTime у батча 2122408 показывает, где заканчивается потерянный интервал.
+
+**0.7.** Состояние кластера перед окном
+```bash
+kafka-topics.sh --bootstrap-server $brokers --command-config $config --describe --under-replicated-partitions
+# должна быть только __consumer_offsets-16
+kafka-topics.sh --bootstrap-server $brokers --command-config $config --describe --under-min-isr-partitions
+# пусто (у __consumer_offsets сейчас min.isr=1)
+```
+Если в выводе есть другие партиции, рестарт брокера 1 может перевести их в offline или under-min-isr. Сначала разберитесь с ними.
+
+**Этап 1.** Окно работ
+Шаг 1. Остановить консьюмеров групп из groups16.txt
+bash
+kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config \
+  --describe --group UserAuditJournal.Prod --state            # STATE = Empty
+
+Проверьте так же несколько других групп из списка.
+
+Шаг 2. Финальный бэкап офсетов
+```bash
+backup_offsets offsets_final
+```
+Шаг 3. Controlled shutdown брокера 1
+
+Остановите брокер штатным способом, как обычно (systemd или скрипт). Лидерство остальных партиций перейдёт на брокеры 2 и 4. Партицию 16 передать некому, поэтому сообщения о неудачных попытках controlled shutdown в логе ожидаемы.
+
+```bash
+kafka-topics.sh --bootstrap-server $brokers --command-config $config \
+  --describe --topic __consumer_offsets | grep -P "Partition: 16\t"        # Leader: none
+pgrep -af kafka.Kafka                                                        # на брокере 1 пусто
+```
+Шаг 4. Резервная копия каталога партиции
+```bash
+mkdir -p /kafka/corrupt_backup
+cp -a --sparse=always /kafka/data/kafka/__consumer_offsets-16 /kafka/corrupt_backup/
+```
+Шаг 5. Замена сегмента
+```bash
+D=/kafka/data/kafka/__consumer_offsets-16
+W=/kafka/repair_p16
+
+sha256sum -c $W/orig.sha256        # OK: исходник не менялся с момента подготовки
+```
+Если проверка не прошла, остановитесь и не продолжайте.
+
+```bash
+cp --sparse=never $W/00000000000001539455.log $D/00000000000001539455.log
+chown kafka:kafka $D/00000000000001539455.log
+rm -f $D/00000000000001539455.index $D/00000000000001539455.timeindex $D/00000000000001539455.txnindex
+sync
+
+echo $D/00000000000001539455.log | python3 /tmp/scan_segments.py     # «с проблемами 0»
+echo $D/00000000000001539455.log | python3 /tmp/holes.py              # «файлов с дырами: 0»
+stat -c '%s %U' $D/00000000000001539455.log                           # 96409440 kafka
+```
+Индексы удаляем намеренно: без них Kafka при старте перепроверит этот сегмент и построит индексы заново.
+
+Шаг 6. Запуск брокера 1
+
+Критично: не выполняйте unclean election, пока брокер 1 остановлен. Лидером должен остаться брокер 1.
+
+Запустите брокер и проверьте лог:
+
+```bash
+grep "__consumer_offsets-16" /kafka/kafka/logs/server.log \
+  | grep -iE "index|recover|truncat|corrupt|error|Finished loading"
+```
+Ожидаемо:
+
+сообщение о том, что индекс для сегмента 1539455 не найден и сегмент восстанавливается;
+Finished loading offsets and group metadata from __consumer_offsets-16.
+
+Недопустимо: Truncating, CorruptRecordException, ошибки загрузки групп. Если они есть, переходите к откату.
+
+Шаг 7. Лидер и репликация
+```bash
+kafka-topics.sh --bootstrap-server $brokers --command-config $config \
+  --describe --topic __consumer_offsets | grep -P "Partition: 16\t"
+# сразу: Leader: 1; через минуты: Isr: 1,4,2 (в любом порядке)
+```
+На брокерах 2 и 4 новых ошибок быть не должно:
+
+```bash
+tail -f /kafka/kafka/logs/server.log | grep "__consumer_offsets-16"
+```
+Отставание должно сокращаться до нуля:
+
+```bash
+kafka-log-dirs.sh --bootstrap-server $brokers --command-config $config --describe \
+  --broker-list 1,2,4 --topic-list __consumer_offsets \
+  | grep '^{' | jq -c '.brokers[] | {broker, p: [.logDirs[].partitions[] | select(.partition=="__consumer_offsets-16") | {size, offsetLag}]}'
+```
+Шаг 8. Сверка офсетов групп с финальным бэкапом
+```bash
+backup_offsets offsets_after
+
+while read -r g; do
+  if ! diff -q <(sort "offsets_final/$g.csv") <(sort "offsets_after/$g.csv") >/dev/null; then
+    echo "== РАСХОЖДЕНИЕ: $g"; diff <(sort "offsets_final/$g.csv") <(sort "offsets_after/$g.csv") | head
+  fi
+done < groups16.txt
+```
+Если расхождений нет, переходите к шагу 9. Если есть, восстановите офсеты только у этих групп: сначала прогон без изменений, после проверки то же с --execute.
+
+```bash
+g="имя_группы"
+kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config \
+  --reset-offsets --group "$g" --from-file "offsets_final/$g.csv" --dry-run
+```
+Шаг 9. Запуск консьюмеров
+```bash
+kafka-consumer-groups.sh --bootstrap-server $brokers --command-config $config \
+  --describe --group UserAuditJournal.Prod --offsets
+```
+Выполните дважды с интервалом: CURRENT-OFFSET должен расти, скачков лага быть не должно.
+
+Этап 2. Завершение
+Шаг 10. Вернуть min.insync.replicas=2
+
+Только после того, как ISR партиции 16 содержит все три брокера и под-реплицированных партиций нет:
+
+```bash
+kafka-topics.sh --bootstrap-server $brokers --command-config $config \
+  --describe --topic __consumer_offsets --under-replicated-partitions      # пусто
+
+kafka-configs.sh --bootstrap-server $brokers --command-config $config --alter \
+  --entity-type topics --entity-name __consumer_offsets \
+  --add-config min.insync.replicas=2
+```
+Шаг 11. Убрать лидерство партиции 16 с брокера 1, пока причина не найдена
+```bash
+echo '{"version":1,"partitions":[{"topic":"__consumer_offsets","partition":16,"replicas":[4,2,1]}]}' > p16.json
+kafka-reassign-partitions.sh --bootstrap-server $brokers --command-config $config \
+  --reassignment-json-file p16.json --execute
+kafka-reassign-partitions.sh --bootstrap-server $brokers --command-config $config \
+  --reassignment-json-file p16.json --verify
+kafka-leader-election.sh --bootstrap-server $brokers --admin.config $config \
+  --election-type preferred --topic __consumer_offsets --partition 16
+```
+Координатор групп переедет на брокер 4. Клиенты сделают один короткий ребаланс.
+
+Шаг 12. Контроль в течение суток
+
+Log cleaner после рестарта снова возьмёт партицию 16 и начнёт её компактировать:
+
+```bash
+grep -hiE "uncleanable|corrupt|error" /kafka/kafka/logs/log-cleaner.log | tail
+```
+Также проверьте:
+
+метрика uncleanable-partitions-count равна 0;
+новые дыры не появились: holes.py на брокере 1 раз в сутки, пока инфраструктура не найдёт причину.
+Шаг 13. Уборка
+
+Через неделю стабильной работы удалите /kafka/corrupt_backup и /kafka/repair_p16. Порядок реплик [1,4,2] верните, когда причина на хранилище брокера 1 будет устранена.
+
+Откат (если на шаге 6 или 7 что-то пошло не так)
+Остановите брокер 1.
+Уберите каталог партиции за пределы log.dirs:
+```bash
+   mv /kafka/data/kafka/__consumer_offsets-16 /kafka/corrupt_backup/p16_after_repair
+```
+Пока брокер 1 остановлен, выполните unclean election. Лидером станет брокер 4, первый живой в списке 1,4,2:
+```bash
+   kafka-leader-election.sh --bootstrap-server $brokers --admin.config $config \
+     --election-type unclean --topic __consumer_offsets --partition 16
+   kafka-topics.sh --bootstrap-server $brokers --command-config $config \
+     --describe --topic __consumer_offsets | grep -P "Partition: 16\t"     # Leader: 4
+```
+Если запустить брокер 1 с пустым каталогом до этого шага, он станет лидером с пустым логом.
+4. Запустите брокер 1. Он скопирует партицию с брокера 4.
+5. Восстановите офсеты всех групп из offsets_final (dry-run, затем --execute), как в шаге 8, но для каждой группы из groups16.txt.
+6. Запустите консьюмеров, затем выполните шаги 10–13.
+
+**Чего не делать**
+Не перезапускать брокер 1 до окна работ. Отключите для него автоперезагрузки и обновления.
+Не удалять каталоги партиции 16 на брокерах 2 и 4: это копии для отката.
+Не включать unclean.leader.election.enable глобально. Точечный kafka-leader-election --election-type unclean нужен только при откате.
+Не возвращать min.insync.replicas=2, пока ISR партиции 16 не полный.
