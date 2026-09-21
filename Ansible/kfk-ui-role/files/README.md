@@ -23,5 +23,3 @@ keytool -importcert -noprompt -alias kafka-ca -file ca.crt \
 ```
 
 JAR весит ~100 МБ и по умолчанию исключён из git (см. `.gitignore` рядом).
-Если артефакт нужно хранить в репозитории — уберите правило из `.gitignore`
-или используйте git-lfs.
