@@ -50,6 +50,104 @@ Kafka **не перемещает существующие партиции ав
 Ничего из этого этапа не меняет состояние кластера. Выполнять целиком — ошибка на любом пункте
 означает «не начинать перенос».
 
+### 1.0. Переменные окружения и доступ (соглашение документа)
+
+Все команды ниже написаны в расчёте на две заранее заданные переменные:
+
+| Переменная | Содержимое | Назначение |
+|---|---|---|
+| `$broker` | список всех брокеров кластера через запятую, `host:port,host:port,…` | значение для `--bootstrap-server` |
+| `$config` | `/kafka/secrets/sasl_admin_kafka.properties` | SASL-аутентификация администратора |
+
+```bash
+# задать перед началом работ (значения — из вашего окружения)
+broker=broker1:9092,broker2:9092,broker3:9092,broker4:9092,broker5:9092
+config=/kafka/secrets/sasl_admin_kafka.properties
+export broker config
+```
+
+> `$broker` должен перечислять **все 5** брокеров, включая новые 4 и 5. Тогда ни одна команда
+> плана не сломается, если какой-то брокер окажется недоступен. Список — без пробелов, иначе
+> неэкранированная переменная развалится на несколько аргументов.
+
+#### Флаг для `$config` различается между утилитами
+
+Это главный источник ошибок вида `Exception ... unrecognized option`. Единого флага нет:
+
+| Утилита | Флаг |
+|---|---|
+| `kafka-topics.sh` | `--command-config $config` |
+| `kafka-configs.sh` | `--command-config $config` |
+| `kafka-reassign-partitions.sh` | `--command-config $config` |
+| `kafka-log-dirs.sh` | `--command-config $config` |
+| `kafka-consumer-groups.sh` | `--command-config $config` |
+| `kafka-broker-api-versions.sh` | `--command-config $config` |
+| 🔸 `kafka-leader-election.sh` | **`--admin.config $config`** — отличается от остальных |
+| `kafka-console-producer.sh` | `--producer.config $config` |
+| `kafka-console-consumer.sh` | `--consumer.config $config` |
+| `zookeeper-shell.sh` | не принимает — у ZooKeeper своя аутентификация (JAAS), см. ниже |
+
+#### Проверка доступа перед началом
+
+```bash
+# 1. Переменные заданы и файл читается
+: "${broker:?переменная broker не задана}"
+: "${config:?переменная config не задана}"
+[ -r "$config" ] || { echo "ОШИБКА: $config недоступен для чтения"; exit 1; }
+ls -l "$config"          # ожидаем права 600/640, владелец — пользователь kafka
+grep -E '^(security.protocol|sasl.mechanism)' "$config"
+```
+
+```bash
+# 2. Админ-доступ реально работает (безопасная read-only команда)
+kafka-broker-api-versions.sh --bootstrap-server $broker --command-config $config \
+  | grep -E '^[a-z0-9._-]+:[0-9]+'
+# должно перечислить 5 брокеров; ошибка аутентификации — стоп-фактор
+```
+
+```bash
+# 3. Есть права на изменение конфигов (проверка без побочного эффекта:
+#    читаем динамические конфиги брокера — требует DescribeConfigs)
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type brokers --entity-name 1 --describe
+```
+
+#### Если в кластере включены ACL
+
+Принципал из `$config` должен иметь как минимум:
+
+| Ресурс | Операции | Для чего |
+|---|---|---|
+| `Cluster` | `Describe`, `Alter` | `kafka-reassign-partitions.sh --execute/--verify/--cancel/--list` |
+| `Cluster` | `DescribeConfigs`, `AlterConfigs` | брокерские троттлы `*.replication.throttled.rate` |
+| `Cluster` | `AlterPartitionReassignment` (входит в `Alter`) | сам реассайн |
+| `Topic:*` | `Describe`, `DescribeConfigs`, `AlterConfigs` | топиковые `*.replication.throttled.replicas` |
+| `Topic:*` | `Alter` | preferred leader election |
+| `Group:*` | `Describe` | контроль лага консьюмер-групп (п. 8.1) |
+| `Topic:rebalance-smoke-*` | `Create`, `Write`, `Read`, `Delete` | smoke-тест в п. 9.5 |
+
+Проверить:
+
+```bash
+kafka-acls.sh --bootstrap-server $broker --command-config $config --list
+```
+
+Нехватка прав проявится как `TopicAuthorizationException` / `ClusterAuthorizationException`
+уже на `--execute` — то есть в середине работ. Лучше выяснить это на этапе 0.
+
+#### ZooKeeper
+
+`zookeeper-shell.sh` работает мимо `$config` и мимо SASL брокеров. Он используется в плане только
+в read-only проверках п. 1.1 и 1.4. Если ZK закрыт SASL/ACL, потребуется свой JAAS:
+
+```bash
+KAFKA_OPTS="-Djava.security.auth.login.config=/kafka/secrets/zk_jaas.conf" \
+  zookeeper-shell.sh zk1:2181 <<< "ls /brokers/ids"
+```
+
+Если доступа к ZK нет — не блокирует: всё, что проверяется через ZK, кроме поля `rack`,
+доступно и через `kafka-broker-api-versions.sh` / `kafka-configs.sh`.
+
 ### 1.1. Все 5 брокеров живы и видят друг друга
 
 ```bash
@@ -70,7 +168,8 @@ done
 Через AdminClient (авторитетнее, чем ZK):
 
 ```bash
-kafka-broker-api-versions.sh --bootstrap-server broker1:9092 | grep -E '^[a-z0-9._-]+:[0-9]+'
+kafka-broker-api-versions.sh --bootstrap-server $broker --command-config $config \
+  | grep -E '^[a-z0-9._-]+:[0-9]+'
 # должно перечислить 5 брокеров с их id
 ```
 
@@ -102,7 +201,7 @@ getent hosts broker4 broker5
 ```bash
 for id in 1 2 3 4 5; do
   echo "=== broker $id ==="
-  kafka-configs.sh --bootstrap-server broker1:9092 \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --describe --all \
   | grep -E 'log.dirs|num.replica.fetchers|replica.fetch|min.insync|default.replication|log.retention|log.segment|num.network.threads|num.io.threads|socket.|compression.type|unclean.leader|auto.create.topics|message.max.bytes|inter.broker.protocol.version|log.message.format'
 done
@@ -155,19 +254,22 @@ done
 
 ```bash
 # Под-реплицированных партиций быть не должно
-kafka-topics.sh --bootstrap-server broker1:9092 --describe --under-replicated-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-replicated-partitions
 # ожидаем пустой вывод
 
 # Партиций ниже min.insync.replicas быть не должно
-kafka-topics.sh --bootstrap-server broker1:9092 --describe --under-min-isr-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-min-isr-partitions
 # ожидаем пустой вывод
 
 # Партиций без лидера быть не должно
-kafka-topics.sh --bootstrap-server broker1:9092 --describe --unavailable-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --unavailable-partitions
 # ожидаем пустой вывод
 
 # Не идёт ли уже какой-то реассайн
-kafka-reassign-partitions.sh --bootstrap-server broker1:9092 --list
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config --list
 # ожидаем "No partition reassignments found."
 ```
 
@@ -181,13 +283,14 @@ kafka-reassign-partitions.sh --bootstrap-server broker1:9092 --list
 # Брокерские троттлы
 for id in 1 2 3 4 5; do
   echo -n "broker $id: "
-  kafka-configs.sh --bootstrap-server broker1:9092 \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --describe \
   | grep -o 'replication.throttled.rate=[0-9]*' | tr '\n' ' '; echo
 done
 
 # Топиковые троттлы
-kafka-configs.sh --bootstrap-server broker1:9092 --entity-type topics --describe \
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe \
   | grep -i 'throttled.replicas'
 ```
 
@@ -199,7 +302,8 @@ kafka-configs.sh --bootstrap-server broker1:9092 --entity-type topics --describe
 
 ```bash
 # Реальное распределение по брокерам и лог-дирам
-kafka-log-dirs.sh --bootstrap-server broker1:9092 --describe --broker-list 1,2,3,4,5 \
+kafka-log-dirs.sh --bootstrap-server $broker --command-config $config \
+  --describe --broker-list 1,2,3,4,5 \
   | tail -1 | python3 -c '
 import json,sys,collections
 d=json.load(sys.stdin)
@@ -259,20 +363,25 @@ done
 ```bash
 WORKDIR=/var/tmp/kafka-rebalance-$(date +%Y%m%d)
 mkdir -p "$WORKDIR" && cd "$WORKDIR"
-BS=broker1:9092,broker2:9092,broker3:9092
+
+# переменные окружения (п. 1.0) должны быть в силе и здесь
+echo "broker=$broker"; echo "config=$config"
+[ -r "$config" ] || { echo "нет доступа к $config"; }
 ```
 
 ### 2.2. Полный снимок состояния
 
 ```bash
-kafka-topics.sh --bootstrap-server "$BS" --list > topics.list
+kafka-topics.sh --bootstrap-server $broker --command-config $config --list > topics.list
 wc -l topics.list
 
-kafka-topics.sh --bootstrap-server "$BS" --describe > describe.before.txt
+kafka-topics.sh --bootstrap-server $broker --command-config $config --describe > describe.before.txt
 
-kafka-configs.sh --bootstrap-server "$BS" --entity-type topics --describe > topic-configs.before.txt
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe > topic-configs.before.txt
 
-kafka-log-dirs.sh --bootstrap-server "$BS" --describe --broker-list 1,2,3,4,5 \
+kafka-log-dirs.sh --bootstrap-server $broker --command-config $config \
+  --describe --broker-list 1,2,3,4,5 \
   | tail -1 > log-dirs.before.json
 ```
 
@@ -311,7 +420,7 @@ PY
 **Это единственный артефакт, по которому возможен откат. Без него не начинать.**
 
 ```bash
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --topics-to-move-json-file topics-to-move.json \
   --broker-list "1,2,3,4,5" \
   --generate > generate.out.txt
@@ -679,7 +788,7 @@ throttle = min(
 THROTTLE=31457280   # 30 МБ/с — подставьте своё значение
 
 for id in 1 2 3 4 5; do
-  kafka-configs.sh --bootstrap-server "$BS" \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --alter \
     --add-config "leader.replication.throttled.rate=$THROTTLE,follower.replication.throttled.rate=$THROTTLE"
 done
@@ -687,7 +796,8 @@ done
 # проверить
 for id in 1 2 3 4 5; do
   echo -n "broker $id: "
-  kafka-configs.sh --bootstrap-server "$BS" --entity-type brokers --entity-name $id --describe
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
+    --entity-type brokers --entity-name $id --describe
 done
 ```
 
@@ -701,7 +811,7 @@ done
 ```bash
 # число потоков репликации на брокере (дефолт 1, разумно 2-4 на новых брокерах)
 for id in 4 5; do
-  kafka-configs.sh --bootstrap-server "$BS" \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --alter \
     --add-config "num.replica.fetchers=4"
 done
@@ -723,7 +833,7 @@ done
 ```bash
 B=batch-01.json
 
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file "$B" \
   --throttle $THROTTLE \
   --execute | tee "exec.$B.log"
@@ -740,7 +850,7 @@ sed -n '/Current partition replica assignment/,/^$/p' "exec.$B.log" \
 **Шаг 2 — наблюдение (каждые 30–60 с):**
 
 ```bash
-watch -n 30 "kafka-reassign-partitions.sh --bootstrap-server $BS \
+watch -n 30 "kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file $B --verify --preserve-throttles 2>&1 | tail -20"
 ```
 
@@ -751,7 +861,7 @@ watch -n 30 "kafka-reassign-partitions.sh --bootstrap-server $BS \
 Параллельно смотреть URP:
 
 ```bash
-watch -n 30 "kafka-topics.sh --bootstrap-server $BS --describe --under-replicated-partitions | wc -l"
+watch -n 30 "kafka-topics.sh --bootstrap-server $broker --command-config $config --describe --under-replicated-partitions | wc -l"
 ```
 
 **Шаг 3 — завершение:**
@@ -771,13 +881,15 @@ watch -n 30 "kafka-topics.sh --bootstrap-server $BS --describe --under-replicate
 
 ```bash
 # URP должен вернуться к нулю
-kafka-topics.sh --bootstrap-server "$BS" --describe --under-replicated-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-replicated-partitions
 # under-min-isr тоже пусто
-kafka-topics.sh --bootstrap-server "$BS" --describe --under-min-isr-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-min-isr-partitions
 # активных реассайнов нет
-kafka-reassign-partitions.sh --bootstrap-server "$BS" --list
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config --list
 # место на дисках
-kafka-log-dirs.sh --bootstrap-server "$BS" --describe --broker-list 1,2,3,4,5 | tail -1 \
+kafka-log-dirs.sh --bootstrap-server $broker --command-config $config --describe --broker-list 1,2,3,4,5 | tail -1 \
   | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(b["broker"], round(sum(p["size"] for ld in b["logDirs"] for p in ld["partitions"])/1024**3,1),"GiB") for b in d["brokers"]]'
 ```
 
@@ -791,28 +903,31 @@ kafka-log-dirs.sh --bootstrap-server "$BS" --describe --broker-list 1,2,3,4,5 | 
 cat > run-batch.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-BS="${BS:?set BS}"
-THROTTLE="${THROTTLE:?set THROTTLE}"
+broker="${broker:?переменная broker не задана}"
+config="${config:?переменная config не задана}"
+THROTTLE="${THROTTLE:?переменная THROTTLE не задана}"
 B="$1"
 
 echo "=== $B: предпроверка ==="
-urp=$(kafka-topics.sh --bootstrap-server "$BS" --describe --under-replicated-partitions | wc -l)
+urp=$(kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-replicated-partitions | wc -l)
 [ "$urp" -eq 0 ] || { echo "URP=$urp, отказ"; exit 1; }
-kafka-reassign-partitions.sh --bootstrap-server "$BS" --list | grep -q "No partition reassignments" \
-  || { echo "есть активный реассайн, отказ"; exit 1; }
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config --list \
+  | grep -q "No partition reassignments" || { echo "есть активный реассайн, отказ"; exit 1; }
 
 echo "=== $B: запуск ==="
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file "$B" --throttle "$THROTTLE" --execute | tee "exec.$B.log"
 sed -n '/Current partition replica assignment/,/^$/p' "exec.$B.log" | grep '^{' > "rollback.$B" || true
 
 echo "=== $B: ожидание ==="
 while true; do
-  out=$(kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+  out=$(kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
         --reassignment-json-file "$B" --verify --preserve-throttles 2>&1)
   prog=$(grep -c "is still in progress" <<<"$out" || true)
   fail=$(grep -c "failed" <<<"$out" || true)
-  urp=$(kafka-topics.sh --bootstrap-server "$BS" --describe --under-replicated-partitions | wc -l)
+  urp=$(kafka-topics.sh --bootstrap-server $broker --command-config $config \
+    --describe --under-replicated-partitions | wc -l)
   echo "$(date +%T) в процессе: $prog, ошибок: $fail, URP: $urp"
   [ "$fail" -gt 0 ] && { echo "ЕСТЬ ОШИБКИ"; echo "$out" | grep failed; exit 2; }
   [ "$prog" -eq 0 ] && break
@@ -823,7 +938,9 @@ SH
 chmod +x run-batch.sh
 
 # запуск по одному, с контролем оператора
-BS="$BS" THROTTLE=$THROTTLE ./run-batch.sh batch-01.json
+# broker и config должны быть экспортированы — см. п. 1.0
+export broker config
+THROTTLE=$THROTTLE ./run-batch.sh batch-01.json
 ```
 
 ### 5.3. Что делать, если батч идёт слишком медленно
@@ -839,7 +956,7 @@ BS="$BS" THROTTLE=$THROTTLE ./run-batch.sh batch-01.json
 
 ```bash
 # Отменить текущий (незавершённый) реассайн — партиции вернутся к исходному набору реплик
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file "$B" --cancel
 ```
 
@@ -860,7 +977,7 @@ kafka-reassign-partitions.sh --bootstrap-server "$BS" \
 ```bash
 for f in batch-*.json; do
   [[ "$f" == *full.json ]] && continue
-  kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+  kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
     --reassignment-json-file "$f" --verify
 done
 ```
@@ -870,19 +987,20 @@ done
 ```bash
 # Брокерские лимиты
 for id in 1 2 3 4 5; do
-  kafka-configs.sh --bootstrap-server "$BS" \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --alter \
     --delete-config "leader.replication.throttled.rate,follower.replication.throttled.rate" 2>/dev/null
 done
 
 # Топиковые списки throttled.replicas
-kafka-configs.sh --bootstrap-server "$BS" --entity-type topics --describe \
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe \
   | grep -i 'throttled.replicas' \
   | sed -E 's/.*Configs for topic .([^"]+). are.*/\1/' | sort -u > throttled-topics.list
 
 while read -r t; do
   [ -z "$t" ] && continue
-  kafka-configs.sh --bootstrap-server "$BS" \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type topics --entity-name "$t" --alter \
     --delete-config "leader.replication.throttled.replicas,follower.replication.throttled.replicas"
 done < throttled-topics.list
@@ -891,10 +1009,12 @@ done < throttled-topics.list
 ### 6.3. Контроль
 
 ```bash
-kafka-configs.sh --bootstrap-server "$BS" --entity-type topics --describe | grep -i throttled
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe | grep -i throttled
 # ожидаем пустой вывод
 for id in 1 2 3 4 5; do
-  kafka-configs.sh --bootstrap-server "$BS" --entity-type brokers --entity-name $id --describe
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
+    --entity-type brokers --entity-name $id --describe
 done
 # ожидаем отсутствие *.throttled.rate
 ```
@@ -909,7 +1029,7 @@ done
 ### 7.1. Посмотреть текущий перекос
 
 ```bash
-kafka-topics.sh --bootstrap-server "$BS" --describe \
+kafka-topics.sh --bootstrap-server $broker --command-config $config --describe \
   | awk '/^\tTopic:/ { for (i=1;i<=NF;i++) if ($i=="Leader:") c[$(i+1)]++ }
          END { for (b in c) printf "лидеров на брокере %s: %d\n", b, c[b] }' | sort -V
 ```
@@ -917,7 +1037,7 @@ kafka-topics.sh --bootstrap-server "$BS" --describe \
 ### 7.2. Запустить выборы
 
 ```bash
-kafka-leader-election.sh --bootstrap-server "$BS" \
+kafka-leader-election.sh --bootstrap-server $broker --admin.config $config \
   --election-type PREFERRED --all-topic-partitions
 ```
 
@@ -929,7 +1049,7 @@ kafka-leader-election.sh --bootstrap-server "$BS" \
 cat > elect.json <<'EOF'
 {"partitions":[{"topic":"my-topic","partition":0},{"topic":"my-topic","partition":1}]}
 EOF
-kafka-leader-election.sh --bootstrap-server "$BS" \
+kafka-leader-election.sh --bootstrap-server $broker --admin.config $config \
   --election-type PREFERRED --path-to-json-file elect.json
 ```
 
@@ -938,7 +1058,8 @@ kafka-leader-election.sh --bootstrap-server "$BS" \
 Проверить, включено ли штатное периодическое выравнивание:
 
 ```bash
-kafka-configs.sh --bootstrap-server "$BS" --entity-type brokers --entity-name 1 --describe --all \
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type brokers --entity-name 1 --describe --all \
   | grep -E 'auto.leader.rebalance.enable|leader.imbalance'
 ```
 
@@ -966,7 +1087,7 @@ cat > topics-to-move-offsets.json <<'EOF'
 {"topics":[{"topic":"__consumer_offsets"}],"version":1}
 EOF
 
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --topics-to-move-json-file topics-to-move-offsets.json \
   --broker-list "1,2,3,4,5" --generate > generate.offsets.txt
 
@@ -983,12 +1104,15 @@ cat plan.offsets.txt
 
 ```bash
 # Лаг критичных групп не растёт
-kafka-consumer-groups.sh --bootstrap-server "$BS" --describe --group <critical-group>
+GROUP=my-critical-group          # подставьте имя своей критичной группы
+kafka-consumer-groups.sh --bootstrap-server $broker --command-config $config \
+  --describe --group "$GROUP"
 
 # Нет групп в состоянии, отличном от Stable/Empty
-kafka-consumer-groups.sh --bootstrap-server "$BS" --list \
+kafka-consumer-groups.sh --bootstrap-server $broker --command-config $config --list \
   | while read -r g; do
-      st=$(kafka-consumer-groups.sh --bootstrap-server "$BS" --describe --group "$g" --state \
+      st=$(kafka-consumer-groups.sh --bootstrap-server $broker --command-config $config \
+        --describe --group "$g" --state \
            2>/dev/null | awk 'NR==2{print $(NF-1)}')
       [[ "$st" == "Stable" || "$st" == "Empty" ]] || echo "$g -> $st"
     done
@@ -1000,7 +1124,8 @@ kafka-consumer-groups.sh --bootstrap-server "$BS" --list \
 тоже надо разложить. Процедура идентична п. 8.1, батчи по 5 партиций.
 
 ```bash
-kafka-topics.sh --bootstrap-server "$BS" --describe --topic __transaction_state | head -3
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --topic __transaction_state | head -3
 ```
 
 Если топик отсутствует — транзакции не используются, шаг пропускается.
@@ -1021,7 +1146,7 @@ kafka-topics.sh --bootstrap-server "$BS" --describe --topic __transaction_state 
 ### 9.1. Распределение реплик и лидеров
 
 ```bash
-kafka-topics.sh --bootstrap-server "$BS" --describe > describe.after.txt
+kafka-topics.sh --bootstrap-server $broker --command-config $config --describe > describe.after.txt
 
 awk '/^\tTopic:/ {
   for (i=1;i<=NF;i++) {
@@ -1038,7 +1163,7 @@ END { for (b in rep) printf "broker %s: реплик %5d, лидеров %5d\n",
 ### 9.2. Объём данных по брокерам
 
 ```bash
-kafka-log-dirs.sh --bootstrap-server "$BS" --describe --broker-list 1,2,3,4,5 | tail -1 \
+kafka-log-dirs.sh --bootstrap-server $broker --command-config $config --describe --broker-list 1,2,3,4,5 | tail -1 \
   > log-dirs.after.json
 
 python3 - <<'PY'
@@ -1058,11 +1183,16 @@ PY
 ### 9.3. Здоровье кластера
 
 ```bash
-kafka-topics.sh --bootstrap-server "$BS" --describe --under-replicated-partitions   # пусто
-kafka-topics.sh --bootstrap-server "$BS" --describe --under-min-isr-partitions      # пусто
-kafka-topics.sh --bootstrap-server "$BS" --describe --unavailable-partitions        # пусто
-kafka-reassign-partitions.sh --bootstrap-server "$BS" --list                        # нет активных
-kafka-configs.sh --bootstrap-server "$BS" --entity-type topics --describe | grep -i throttled  # пусто
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-replicated-partitions   # пусто
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-min-isr-partitions      # пусто
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --unavailable-partitions        # пусто
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --list                        # нет активных
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe | grep -i throttled  # пусто
 ```
 
 ### 9.4. Ничего не потеряно
@@ -1088,7 +1218,8 @@ for k in list(bad)[:10]: print("  ", k, a[k], "->", b[k])
 PY
 
 # Конфиги топиков не изменились
-kafka-configs.sh --bootstrap-server "$BS" --entity-type topics --describe > topic-configs.after.txt
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type topics --describe > topic-configs.after.txt
 diff topic-configs.before.txt topic-configs.after.txt
 ```
 
@@ -1096,18 +1227,18 @@ diff topic-configs.before.txt topic-configs.after.txt
 
 ```bash
 T=rebalance-smoke-$(date +%s)
-kafka-topics.sh --bootstrap-server "$BS" --create --topic "$T" \
+kafka-topics.sh --bootstrap-server $broker --command-config $config --create --topic "$T" \
   --partitions 10 --replication-factor 3
 
 # новый топик должен автоматически лечь на все 5 брокеров
-kafka-topics.sh --bootstrap-server "$BS" --describe --topic "$T"
+kafka-topics.sh --bootstrap-server $broker --command-config $config --describe --topic "$T"
 
-seq 1 1000 | kafka-console-producer.sh --bootstrap-server "$BS" --topic "$T" \
-  --producer-property acks=all
-kafka-console-consumer.sh --bootstrap-server "$BS" --topic "$T" \
-  --from-beginning --timeout-ms 15000 | wc -l   # ожидаем 1000
+seq 1 1000 | kafka-console-producer.sh --bootstrap-server $broker \
+  --producer.config $config --topic "$T" --producer-property acks=all
+kafka-console-consumer.sh --bootstrap-server $broker \
+  --consumer.config $config --topic "$T" --from-beginning --timeout-ms 15000 | wc -l   # 1000
 
-kafka-topics.sh --bootstrap-server "$BS" --delete --topic "$T"
+kafka-topics.sh --bootstrap-server $broker --command-config $config --delete --topic "$T"
 ```
 
 ### 9.6. Метрики и приложения
@@ -1128,7 +1259,7 @@ kafka-topics.sh --bootstrap-server "$BS" --delete --topic "$T"
 ```bash
 # Вернуть num.replica.fetchers, если меняли
 for id in 4 5; do
-  kafka-configs.sh --bootstrap-server "$BS" \
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
     --entity-type brokers --entity-name $id --alter --delete-config "num.replica.fetchers"
 done
 
@@ -1146,7 +1277,7 @@ tar czf ~/kafka-rebalance-$(date +%Y%m%d).tar.gz "$WORKDIR"
 ### 10.1. Откат незавершённого батча
 
 ```bash
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file batch-NN.json --cancel
 ```
 
@@ -1160,11 +1291,11 @@ kafka-reassign-partitions.sh --bootstrap-server "$BS" \
 
 ```bash
 # Полный откат к состоянию до работ
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file rollback-assignment.json \
   --throttle $THROTTLE --execute
 
-kafka-reassign-partitions.sh --bootstrap-server "$BS" \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file rollback-assignment.json --verify --preserve-throttles
 ```
 
@@ -1206,7 +1337,7 @@ kafka-reassign-partitions.sh --bootstrap-server "$BS" \
 
 ```bash
 # 1. Что вообще идёт
-kafka-reassign-partitions.sh --bootstrap-server "$BS" --list
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config --list
 
 # 2. Кто отстаёт (на брокерах 4, 5)
 ssh broker4 "grep -iE 'ReplicaFetcher|Truncat|OutOfRange|Error' /var/log/kafka/server.log | tail -40"
@@ -1220,7 +1351,8 @@ ssh broker4 "iostat -x 5 3; sar -n DEV 5 3"
 # 5. Действующие троттлы
 for id in 1 2 3 4 5; do
   echo -n "broker $id: "
-  kafka-configs.sh --bootstrap-server "$BS" --entity-type brokers --entity-name $id --describe
+  kafka-configs.sh --bootstrap-server $broker --command-config $config \
+    --entity-type brokers --entity-name $id --describe
 done
 ```
 
@@ -1240,13 +1372,14 @@ done
 
 ```bash
 # Кандидаты: топики с числом партиций < 5 и заметным трафиком
-kafka-topics.sh --bootstrap-server "$BS" --describe \
+kafka-topics.sh --bootstrap-server $broker --command-config $config --describe \
   | awk '/PartitionCount:/ { for(i=1;i<=NF;i++) if($i=="PartitionCount:") p=$(i+1);
                              for(i=1;i<=NF;i++) if($i=="Topic:") t=$(i+1);
                              if (p+0 < 5) print t, p }'
 
 # Расширение (после согласования!)
-kafka-topics.sh --bootstrap-server "$BS" --alter --topic my-topic --partitions 10
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --alter --topic my-topic --partitions 10
 ```
 
 Новые партиции Kafka сама разложит с учётом всех 5 брокеров.
@@ -1270,33 +1403,50 @@ Kafka 3.9 — последняя мажорная ветка с поддержк
 
 ## 13. Шпаргалка команд
 
+Предполагается, что `$broker` и `$config` заданы согласно п. 1.0.
+Обратите внимание на `--admin.config` у `kafka-leader-election.sh` — у всех остальных
+утилит флаг называется `--command-config`.
+
 ```bash
 # Состояние
-kafka-topics.sh --bootstrap-server $BS --describe --under-replicated-partitions
-kafka-topics.sh --bootstrap-server $BS --describe --under-min-isr-partitions
-kafka-topics.sh --bootstrap-server $BS --describe --unavailable-partitions
-kafka-reassign-partitions.sh --bootstrap-server $BS --list
-kafka-log-dirs.sh --bootstrap-server $BS --describe --broker-list 1,2,3,4,5
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-replicated-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --under-min-isr-partitions
+kafka-topics.sh --bootstrap-server $broker --command-config $config \
+  --describe --unavailable-partitions
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config --list
+kafka-log-dirs.sh --bootstrap-server $broker --command-config $config \
+  --describe --broker-list 1,2,3,4,5
 
 # Реассайн
-kafka-reassign-partitions.sh --bootstrap-server $BS --topics-to-move-json-file t.json \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --topics-to-move-json-file t.json \
   --broker-list 1,2,3,4,5 --generate
-kafka-reassign-partitions.sh --bootstrap-server $BS --reassignment-json-file p.json \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --reassignment-json-file p.json \
   --throttle 31457280 --execute
-kafka-reassign-partitions.sh --bootstrap-server $BS --reassignment-json-file p.json \
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --reassignment-json-file p.json \
   --verify --preserve-throttles
-kafka-reassign-partitions.sh --bootstrap-server $BS --reassignment-json-file p.json --verify
-kafka-reassign-partitions.sh --bootstrap-server $BS --reassignment-json-file p.json --cancel
-kafka-reassign-partitions.sh --bootstrap-server $BS --reassignment-json-file p2.json --additional
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --reassignment-json-file p.json --verify
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --reassignment-json-file p.json --cancel
+kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
+  --reassignment-json-file p2.json --additional
 
 # Троттлинг
-kafka-configs.sh --bootstrap-server $BS --entity-type brokers --entity-name 1 --alter \
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type brokers --entity-name 1 --alter \
   --add-config "leader.replication.throttled.rate=31457280,follower.replication.throttled.rate=31457280"
-kafka-configs.sh --bootstrap-server $BS --entity-type brokers --entity-name 1 --alter \
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type brokers --entity-name 1 --alter \
   --delete-config "leader.replication.throttled.rate,follower.replication.throttled.rate"
 
 # Лидеры
-kafka-leader-election.sh --bootstrap-server $BS --election-type PREFERRED --all-topic-partitions
+kafka-leader-election.sh --bootstrap-server $broker --admin.config $config \
+  --election-type PREFERRED --all-topic-partitions
 
 # ZooKeeper
 zookeeper-shell.sh zk1:2181 <<< "ls /brokers/ids"
@@ -1308,6 +1458,9 @@ zookeeper-shell.sh zk1:2181 <<< "get /brokers/ids/4"
 ## 14. Итоговый чек-лист
 
 **Подготовка**
+- [ ] Заданы и экспортированы `$broker` (все 5 брокеров) и `$config` (п. 1.0)
+- [ ] `$config` читается, админ-доступ подтверждён `kafka-broker-api-versions.sh`
+- [ ] ACL принципала достаточны (Cluster: Alter/AlterConfigs; Topic: AlterConfigs/Alter)
 - [ ] 5 брокеров в `/brokers/ids`, `kafka-broker-api-versions.sh` видит все 5
 - [ ] TCP-связность проверена во все стороны
 - [ ] Конфиги новых брокеров сверены со старыми (п. 1.3)
