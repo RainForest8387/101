@@ -1,25 +1,64 @@
-# Упрощённый вариант: RF 3 → 5 пачками через штатный `kafka-reassign-partitions.sh`
+# Kafka: перевод кластера с 3 на 5 брокеров и с RF=3 на RF=5 пачками через `kafka-reassign-partitions.sh`
 
 **Кластер:** Kafka 3.9.1, режим ZooKeeper
-**Было:** брокеры 1, 2, 3, у топиков replication factor = 3
-**Стало:** брокеры 1, 2, 3, 4, 5, у топиков replication factor = 5
-**Подход:** диагностика кластера с сохранением отчёта → пачки по 10 топиков → план из `--generate`,
-дополненный до RF=5 → выполнение пачек по одной под троттлингом
+**Исходное состояние:** данные лежат на брокерах 1, 2, 3, у топиков replication factor = 3.
+Брокеры 4 и 5 уже введены в кластер (зарегистрированы в ZooKeeper, сетевая связность есть), но
+**пусты**: Kafka сама не переносит на новые брокеры существующие партиции.
+**Цель:** данные на всех пяти брокерах, у топиков replication factor = 5.
+**Подход:** диагностика кластера с сохранением отчёта → пачки по 10 топиков → план из штатного
+`--generate`, дополненный до RF=5 → выполнение пачек по одной под троттлингом
 **Документ составлен:** 24.09.2026
-**Связанный документ:** [kafka-rebalance-3-to-5-brokers-plan.md](kafka-rebalance-3-to-5-brokers-plan.md) —
-полный вариант с перераспределением при RF=3 и подробными разделами про троттлинг, риски и диагностику
 
 ---
 
-## 0. Суть варианта и чем он отличается от основного плана
+## 0. Суть работ
 
-| | Основной план | Этот (упрощённый) вариант |
+### Почему брокеры 4 и 5 пусты
+
+Kafka не перемещает существующие партиции автоматически. Новый брокер получает реплики только:
+
+* новых топиков, созданных после его ввода;
+* новых партиций, добавленных в существующие топики;
+* партиций, явно переназначенных через `kafka-reassign-partitions.sh`.
+
+Поэтому брокеры 4 и 5 будут пустыми, пока реплики не назначат им явно. Этим и занимается план.
+
+### Что будет сделано
+
+| | Сейчас | После работ |
 |---|---|---|
-| RF после работ | 3 | **5** |
-| Что делаем с репликами | переносим 40 % реплик со старых брокеров на новые | **только добавляем** реплики на 4 и 5, ничего не удаляем |
-| Кто считает размещение | свой скрипт (минимум перемещений) | **штатный `--generate`**, результат дополняется до RF=5 |
-| Разбиение | по партициям | **по топикам, 10 штук за раз** |
-| Откат завершённой пачки | обратный перенос (снова копирование данных) | **только удаление добавленных реплик** — быстро, без копирования |
+| Брокеров с данными | 3 (1, 2, 3) | 5 (1–5) |
+| RF пользовательских топиков | 3 | 5 |
+| Реплики партиции | 3 из брокеров 1–3 | все 5 брокеров |
+| Лидеры партиций | на 1–3 | поровну на 1–5 |
+
+Реплики на брокерах 1–3 **не удаляются и не переносятся**. К каждой партиции добавляются реплики на 4 и 5.
+Отсюда два важных свойства:
+
+* копирование данных идёт **только на брокеры 4 и 5**;
+* откат завершённой пачки означает **только удаление добавленных реплик**: это быстро и без копирования данных.
+
+### Что физически происходит при добавлении реплики
+
+1. Контроллер добавляет брокеры 4 и 5 в список реплик партиции.
+2. 4 и 5 как фолловеры вычитывают **всю партицию с лидера с нуля**. Это основной сетевой и дисковый трафик.
+3. Догнав лидера, они входят в ISR. Реассайн партиции завершён.
+4. Лидер не меняется сам. Чтобы лидерство переехало на первую реплику списка, нужны preferred-выборы.
+
+Из п. 2 следует главный риск: **неконтролируемое копирование забивает сеть и диски и увеличивает
+задержку продюсеров**. Поэтому троттлинг и пачки обязательны.
+
+### Принципы
+
+| Принцип | Почему |
+|---|---|
+| Сначала диагностика, результат в файл | Работы начинаются только на здоровом кластере; есть база для сравнения «до/после» |
+| Пачки по 10 топиков, от мелких к крупным | Ограничивает объём одновременного копирования; первая пачка — пилотная |
+| Размещение предлагает штатный `--generate` | Не изобретаем свой алгоритм, лидеры распределяются по всем брокерам |
+| Всегда с троттлингом | Без `--throttle` репликация займёт всю полосу |
+| Следующая пачка — только после проверки предыдущей | URP должен вернуться к 0 |
+| Служебные топики — отдельно и последними | `__consumer_offsets` затрагивает все консьюмер-группы |
+| Откат готов до начала | Текущее размещение каждой пачки сохраняется до её выполнения |
 
 ### Почему при RF=5 план получается простым
 
@@ -44,13 +83,13 @@
 | Что меняется | Как именно | Что проверить |
 |---|---|---|
 | Место на дисках | Сейчас каждый из брокеров 1–3 хранит **все** партиции (3 брокера × RF 3). После работ **все пять** брокеров будут хранить всё. Суммарный объём хранения вырастет в 5/3 раза | На брокерах 4 и 5 должно поместиться столько же, сколько сейчас лежит на брокере 1, плюс ≥ 30 % запаса |
-| Нагрузка на диски брокеров 1–3 | **Не уменьшится.** Их данные остаются на месте. Разгружается только лидерство (запись от продюсеров, чтение консьюмерами) | Если цель — освободить диски старых брокеров, этот вариант не подходит, нужен основной план |
+| Нагрузка на диски брокеров 1–3 | **Не уменьшится.** Их данные остаются на месте. Разгружается только лидерство (запись от продюсеров, чтение консьюмерами) | Если цель — освободить диски брокеров 1–3, нужен другой подход: перенос части реплик на 4 и 5 при RF=3 (в этом документе не рассматривается) |
 | Сетевой трафик репликации | Каждый лидер отдаёт данные **4** фолловерам вместо 2, то есть исходящий трафик репликации удваивается | Запас сети на брокерах с учётом пикового `BytesInPerSec × 4` |
 | Задержка `acks=all` | Лидер ждёт подтверждения от всех реплик ISR, теперь их 5. p99 записи может вырасти, особенно если один брокер медленнее остальных | Сравнить p99 `Produce TotalTimeMs` до и после пилотной пачки |
 | Отказоустойчивость | Растёт: при полном ISR данные переживают потерю 4 брокеров. Реальные гарантии для подтверждённой записи задаёт `min.insync.replicas` | Решение по `min.insync.replicas` (п. 8.1) |
 | Новые топики | Будут создаваться с `default.replication.factor` (обычно 3), а не 5 | Решение по п. 8.2 |
 
-Если что-то из этого неприемлемо, остановиться и выбрать основной план.
+Если что-то из этого неприемлемо, работы не начинать и пересмотреть целевой RF.
 
 ### Схема работ
 
@@ -73,7 +112,12 @@
 
 ### 1.1. Переменные окружения
 
-Соглашение то же, что в основном плане (п. 1.0 там): `$broker` и `$config`.
+Все команды документа рассчитаны на две переменные с доступом к кластеру и набор параметров плана:
+
+| Переменная | Содержимое |
+|---|---|
+| `$broker` | все брокеры через запятую, `host:port,host:port,…` — значение для `--bootstrap-server` |
+| `$config` | properties-файл с SASL-аутентификацией администратора |
 
 ```bash
 # доступ к кластеру
@@ -88,27 +132,126 @@ MAX_PARTS=300              # не больше партиций в пачке (�
 LARGE_GIB=100              # топик больше этого объёма (GiB) идёт отдельной пачкой
 THROTTLE=31457280          # 30 МБ/с на брокер, уточняется в этапе 3
 
+NEW_BROKERS=4,5            # id новых (пока пустых) брокеров
+
 # необязательные
 ZK=zk1:2181                             # для проверки /brokers/ids и /controller; пусто, если нет доступа
 DF_HOSTS="broker1 broker2 broker3 broker4 broker5"   # для df по ssh; пусто, если нет ssh
 KAFKA_DATA_DIR=/kafka/data              # каталог log.dirs для df
 
-export broker config BROKERS TARGET_RF BATCH_TOPICS MAX_PARTS LARGE_GIB THROTTLE ZK DF_HOSTS KAFKA_DATA_DIR
+export broker config BROKERS NEW_BROKERS TARGET_RF BATCH_TOPICS MAX_PARTS LARGE_GIB THROTTLE ZK DF_HOSTS KAFKA_DATA_DIR
 ```
 
+> `$broker` должен перечислять **все 5** брокеров, без пробелов. Тогда команды не сломаются, если
+> какой-то один брокер окажется недоступен.
 > Утилиты Kafka (`kafka-topics.sh` и т. д.) должны быть в `PATH`. Нужен `python3` (3.6+),
 > дополнительные модули не требуются.
-> `kafka-leader-election.sh` принимает конфиг через **`--admin.config`**, а не `--command-config`.
 
-Быстрая проверка доступа:
+#### Флаг для `$config` различается между утилитами
+
+| Утилита | Флаг |
+|---|---|
+| `kafka-topics.sh`, `kafka-configs.sh`, `kafka-reassign-partitions.sh`, `kafka-log-dirs.sh`, `kafka-consumer-groups.sh`, `kafka-broker-api-versions.sh` | `--command-config $config` |
+| `kafka-leader-election.sh` | **`--admin.config $config`** |
+| `zookeeper-shell.sh` | не принимает, у ZooKeeper своя аутентификация (см. п. 1.2) |
+
+### 1.2. Проверка доступа и прав
 
 ```bash
-[ -r "$config" ] || echo "ОШИБКА: $config недоступен"
+: "${broker:?переменная broker не задана}"
+: "${config:?переменная config не задана}"
+[ -r "$config" ] || echo "ОШИБКА: $config недоступен для чтения"
+ls -l "$config"          # ожидаем права 600/640
+
+# админ-доступ работает, видны все 5 брокеров
 kafka-broker-api-versions.sh --bootstrap-server $broker --command-config $config | grep -E '^\S+ \(id:'
-# ожидаем 5 строк: (id: 1 …) … (id: 5 …)
+# ожидаем 5 строк: (id: 1 …) … (id: 5 …); ошибка аутентификации — стоп
+
+# есть право DescribeConfigs
+kafka-configs.sh --bootstrap-server $broker --command-config $config \
+  --entity-type brokers --entity-name 1 --describe
 ```
 
-### 1.2. Рабочий каталог
+Если в кластере включены ACL, принципалу из `$config` нужны:
+
+| Ресурс | Операции | Для чего |
+|---|---|---|
+| `Cluster` | `Describe`, `Alter` | `kafka-reassign-partitions.sh --execute / --verify / --cancel / --list` |
+| `Cluster` | `DescribeConfigs`, `AlterConfigs` | брокерские троттлы `*.replication.throttled.rate` |
+| `Topic:*` | `Describe`, `DescribeConfigs`, `AlterConfigs` | топиковые `*.replication.throttled.replicas`, `--generate` |
+| `Topic:*` | `Alter` | preferred leader election |
+| `Group:*` | `Describe` | проверка консьюмер-групп (п. 6.1) |
+
+```bash
+kafka-acls.sh --bootstrap-server $broker --command-config $config --list
+```
+
+Нехватка прав проявится как `ClusterAuthorizationException` / `TopicAuthorizationException`
+уже на `--execute`, то есть посреди работ. Лучше выяснить это заранее.
+
+**ZooKeeper** используется только для чтения (`/brokers/ids`, `/controller`) в диагностике. Если ZK
+закрыт SASL, нужен свой JAAS:
+
+```bash
+export KAFKA_OPTS="-Djava.security.auth.login.config=/kafka/secrets/zk_jaas.conf"
+zookeeper-shell.sh zk1:2181 ls /brokers/ids
+```
+
+Если доступа к ZK нет, оставьте `ZK` пустым. Работам это не мешает.
+
+### 1.3. Готовность брокеров 4 и 5
+
+**Регистрация и адреса.** Брокеры 4 и 5 должны быть видны AdminClient (п. 1.2). Если есть доступ к ZK,
+проверьте, что в `endpoints` указаны реальные разрешимые имена или IP, а не `localhost`:
+
+```bash
+for id in 4 5; do zookeeper-shell.sh $ZK get /brokers/ids/$id | tail -1; done
+```
+
+**Сетевая связность в обе стороны.** Одного `ping` недостаточно, нужен TCP до listener-порта
+по адресам из `advertised.listeners`. Запустить на **каждом** брокере:
+
+```bash
+for h in broker1 broker2 broker3 broker4 broker5; do
+  timeout 3 bash -c "</dev/tcp/$h/9092" && echo "OK   $h:9092" || echo "FAIL $h:9092"
+done
+getent hosts broker4 broker5      # имена новых брокеров резолвятся на старых брокерах и у клиентов
+```
+
+**Конфигурация.** Параметры брокеров сравнивает диагностика (п. 2, таблица «Параметры брокеров»).
+Расхождение в `inter.broker.protocol.version`, `message.max.bytes`, `replica.fetch.max.bytes`,
+`unclean.leader.election.enable` даёт вердикт «НЕ ЗДОРОВ». Например, если на новом брокере
+`replica.fetch.max.bytes` меньше `message.max.bytes`, фолловер не сможет вычитать крупный батч
+и никогда не войдёт в ISR.
+
+**Диски.** На 4 и 5 должно хватить места под **весь** уникальный объём данных кластера (столько же,
+сколько сейчас на брокере 1) плюс ≥ 30 % запаса. Количество дисков и `log.dirs` должны совпадать со старыми брокерами.
+
+### 1.4. Базовые значения метрик
+
+Снять до начала работ, чтобы было с чем сравнивать после пилотной пачки:
+
+| Метрика (JMX) | Зачем |
+|---|---|
+| `kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions` | 0 до, во время (кроме пачки) и после |
+| `kafka.server:type=ReplicaManager,name=PartitionCount`, `LeaderCount` | реплики и лидеры на брокере |
+| `kafka.controller:type=KafkaController,name=ActiveControllerCount` | ровно 1 на кластер |
+| `kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce` (p99) | влияние на продюсеров |
+| `kafka.network:type=RequestMetrics,name=TotalTimeMs,request=FetchConsumer` (p99) | влияние на консьюмеров |
+| `kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec` / `BytesOutPerSec` | штатная нагрузка, запас сети |
+| `kafka.server:type=BrokerTopicMetrics,name=ReplicationBytesInPerSec` | фактическая скорость копирования на 4 и 5 |
+| `kafka.server:type=ReplicaFetcherManager,name=MaxLag,clientId=Replica` | отставание фолловеров |
+| Лаг критичных консьюмер-групп | влияние на бизнес |
+
+### 1.5. Организационное
+
+- [ ] Согласовано окно работ (пачки можно выполнять под нагрузкой, но начинать лучше вне пика).
+- [ ] У исполнителя есть Admin-доступ к кластеру, SSH и JMX ко всем 5 брокерам.
+- [ ] Определён стоп-сигнал: при каких значениях latency и лага работы приостанавливаются.
+- [ ] Владельцы критичных приложений предупреждены, в том числе о переходе на RF=5 и `acks=all` (п. 0).
+- [ ] У клиентов в `bootstrap.servers` желательно добавить broker4 и broker5 при ближайшем деплое (не обязательно).
+
+### 1.6. Рабочий каталог
 
 Все артефакты хранятся в одном каталоге. Работать внутри `tmux`/`screen`: пачка может идти часами.
 
@@ -121,7 +264,7 @@ mkdir -p "$WORKDIR" && cd "$WORKDIR"
 
 ```
 kafka-rf5-YYYYMMDD/
-├── rf5tool.py                  # расчёты (п. 1.3)
+├── rf5tool.py                  # расчёты (п. 1.7)
 ├── diagnose.sh                 # диагностика (п. 2.1)
 ├── prepare-batches.sh          # подготовка пачек (п. 3.1)
 ├── run-batch.sh                # выполнение одной пачки (п. 5.1)
@@ -141,7 +284,7 @@ kafka-rf5-YYYYMMDD/
     └── progress.log            # журнал выполнения
 ```
 
-### 1.3. Вспомогательный скрипт `rf5tool.py`
+### 1.7. Вспомогательный скрипт `rf5tool.py`
 
 Скрипт **только читает файлы** в рабочем каталоге и в кластер не ходит. Все обращения к Kafka
 делаются штатными утилитами в bash-скриптах ниже. Подкоманды:
@@ -248,6 +391,27 @@ def broker_setting(text, name):
     return m.group(1) if m else None
 
 
+# (параметр, критично ли расхождение). Критичное расхождение = кластер НЕ ЗДОРОВ.
+CFG_KEYS = [
+    ('inter.broker.protocol.version', True),
+    ('message.max.bytes', True),
+    ('replica.fetch.max.bytes', True),
+    ('unclean.leader.election.enable', True),
+    ('min.insync.replicas', False),
+    ('default.replication.factor', False),
+    ('offsets.topic.replication.factor', False),
+    ('transaction.state.log.replication.factor', False),
+    ('auto.leader.rebalance.enable', False),
+    ('num.replica.fetchers', False),
+    ('log.retention.hours', False),
+    ('log.retention.ms', False),
+    ('log.retention.bytes', False),
+    ('log.segment.bytes', False),
+    ('compression.type', False),
+    ('broker.rack', False),
+]
+
+
 def is_internal(t):
     return t.startswith('__')
 
@@ -275,7 +439,8 @@ def cmd_diag(a):
     api = read(f'{D}/brokers-api.txt')
     seen = {int(m.group(1)): m.group(2) for m in
             re.finditer(r'^\S+ \(id: (\d+) rack: ([^)]*)\)', api, re.M)}
-    ball = read(f'{D}/broker-all.txt')
+    ball_by = {b: read(f'{D}/broker-all-{b}.txt') for b in brokers}
+    ball = next((t for t in ball_by.values() if t), '')
     default_min_isr = int(broker_setting(ball, 'min.insync.replicas') or 1)
 
     n_parts = n_repl = 0
@@ -352,6 +517,18 @@ def cmd_diag(a):
         warn.append('остались троттлы репликации (брокеры/топики) — снять или учесть')
     if not topics:
         fail.append('describe.txt пуст — kafka-topics.sh не отработал')
+    new_b = ints(a.new_brokers) if a.new_brokers else []
+    new_busy = {b: repl_on[b] for b in new_b if repl_on[b]}
+    if new_busy and a.stage == 'before':
+        warn.append(f'на новых брокерах уже есть реплики: {new_busy} (топики, созданные после их ввода?)')
+    cfg_rows, cfg_bad = [], []
+    for k, critical in CFG_KEYS:
+        vals = {b: broker_setting(ball_by[b], k) for b in brokers if ball_by[b]}
+        differs = len(set(vals.values())) > 1
+        cfg_rows.append((k, vals, differs, critical))
+        if differs:
+            (fail if critical else warn).append(f'параметр {k} различается на брокерах: {vals}')
+            cfg_bad.append(k)
     if not_preferred:
         warn.append(f'партиций, где лидер не preferred: {not_preferred}')
     odd_rf = sorted(t for t, r in topics.items() if r['rf'] != 3 and not is_internal(t))
@@ -394,7 +571,11 @@ def cmd_diag(a):
     w(f'| Ошибки log dirs | {len(ld_errors)} | 0 |')
     w(f'| Брокеры с throttled.rate | {[b for b, v in b_thr.items() if v] or "нет"} | нет |')
     w(f'| Топики с throttled.replicas | {len(t_thr)} | 0 |')
-    w(f'| Лидер не на preferred-реплике | {not_preferred} | 0 (или мало) |\n')
+    w(f'| Лидер не на preferred-реплике | {not_preferred} | 0 (или мало) |')
+    if new_b:
+        w(f'| Реплик на новых брокерах {new_b} | {sum(repl_on[b] for b in new_b)} | '
+          f'{"0 (этап before)" if a.stage == "before" else "= число партиций"} |')
+    w(f'| Параметры, различающиеся между брокерами | {", ".join(cfg_bad) or "нет"} | нет |\n')
     for x in ld_errors:
         w(f'* {x}')
 
@@ -440,14 +621,12 @@ def cmd_diag(a):
     if df:
         w('Свободное место (df):\n\n```\n' + df + '\n```\n')
 
-    w('### Ключевые параметры брокера (broker-all.txt)\n')
-    w('| Параметр | Значение |')
-    w('|---|---|')
-    for k in ('default.replication.factor', 'min.insync.replicas', 'offsets.topic.replication.factor',
-              'transaction.state.log.replication.factor', 'auto.leader.rebalance.enable',
-              'unclean.leader.election.enable', 'num.replica.fetchers', 'replica.fetch.max.bytes',
-              'message.max.bytes', 'inter.broker.protocol.version'):
-        w(f'| `{k}` | {broker_setting(ball, k) or "-"} |')
+    w('### Параметры брокеров (`kafka-configs.sh --describe --all`)\n')
+    w('| Параметр | ' + ' | '.join(f'broker {b}' for b in brokers) + ' | Совпадают |')
+    w('|---|' + '---|' * len(brokers) + '---|')
+    for k, vals, differs, critical in cfg_rows:
+        mark = ('НЕТ (критично)' if critical else 'НЕТ') if differs else 'да'
+        w(f'| `{k}` | ' + ' | '.join(str(vals.get(b) or '-') for b in brokers) + f' | {mark} |')
     w('')
 
     w(f'## 5. Оценка перехода на RF={a.target_rf}\n')
@@ -654,6 +833,7 @@ def main():
     p.add_argument('--throttle', type=int, default=0)
     p.add_argument('--stage', default='before')
     p.add_argument('--date', default='')
+    p.add_argument('--new-brokers', default='4,5')
     p.set_defaults(fn=cmd_diag)
 
     p = sp.add_parser('plan')
@@ -739,9 +919,9 @@ run under-min-isr.txt  kafka-topics.sh $K --describe --under-min-isr-partitions
 run unavailable.txt    kafka-topics.sh $K --describe --unavailable-partitions
 run reassign-list.txt  kafka-reassign-partitions.sh $K --list
 run topic-configs.txt  kafka-configs.sh $K --entity-type topics --describe
-run broker-all.txt     kafka-configs.sh $K --entity-type brokers --entity-name "${BROKERS%%,*}" --describe --all
 for id in ${BROKERS//,/ }; do
   run "broker-dyn-$id.txt" kafka-configs.sh $K --entity-type brokers --entity-name "$id" --describe
+  run "broker-all-$id.txt" kafka-configs.sh $K --entity-type brokers --entity-name "$id" --describe --all
 done
 run logdirs.raw        kafka-log-dirs.sh $K --describe --broker-list "$BROKERS"
 tail -1 "$D/logdirs.raw" > "$D/logdirs.json"
@@ -757,8 +937,8 @@ if [ -n "${DF_HOSTS:-}" ]; then
 fi
 
 python3 rf5tool.py diag --dir "$D" --out "cluster-report-$STAGE.md" --stage "$STAGE" \
-  --brokers "$BROKERS" --target-rf "${TARGET_RF:-5}" --throttle "${THROTTLE:-0}" \
-  --date "$(date '+%F %T %Z')"
+  --brokers "$BROKERS" --new-brokers "${NEW_BROKERS:-4,5}" \
+  --target-rf "${TARGET_RF:-5}" --throttle "${THROTTLE:-0}" --date "$(date '+%F %T %Z')"
 rc=$?
 { echo; echo '---'; echo; cat "cluster-report-$STAGE.md"; } >> REPORT.md
 echo "== отчёт дописан в REPORT.md"
@@ -790,10 +970,11 @@ less cluster-report-before.md
 | Раздел отчёта | Содержание | Что делать |
 |---|---|---|
 | 1. Итог | ЗДОРОВ / НЕ ЗДОРОВ + список причин `[FAIL]` и предупреждений `[WARN]` | При «НЕ ЗДОРОВ» **не начинать**. Разобраться с каждой причиной и перезапустить `./diagnose.sh before` |
-| 2. Проверки | брокеры, URP, under-min-isr, недоступные партиции, активные реассайны, ошибки дисков, остатки троттлов, лидеры не на preferred | Все значения должны совпадать с колонкой «Ожидается» |
+| 2. Проверки | брокеры, URP, under-min-isr, недоступные партиции, активные реассайны, ошибки дисков, остатки троттлов, лидеры не на preferred, реплики на новых брокерах, расхождения конфигов | Все значения должны совпадать с колонкой «Ожидается» |
 | 3. Топики, партиции, реплики | число топиков (пользовательских/служебных), партиций, реплик, объём данных без учёта реплик и с репликами | Зафиксировать как базу для сравнения «после» |
 | 3. RF и min.insync.replicas | сколько топиков и партиций с каждым RF, распределение min.isr | Топики с RF ≠ 3 см. ниже |
-| 4. Брокеры | по каждому: rack, реплик, лидеров, preferred-лидеров, объём данных, свободное место | Ожидаемо: у 4 и 5 ноль реплик |
+| 4. Брокеры | по каждому: rack, реплик, лидеров, preferred-лидеров, объём данных, свободное место | На этапе `before`: у 4 и 5 ноль реплик |
+| 4. Параметры брокеров | ключевые параметры `--describe --all` всех пяти брокеров рядом, колонка «Совпадают» | Расхождения устранить до начала работ |
 | 5. Оценка перехода на RF=5 | сколько реплик добавится, сколько GiB скопируется, сколько будет на каждом брокере, время | Сверить с местом на дисках 4 и 5 |
 | 6–7. Внимание | топики с RF ≠ 3, топики с `min.insync.replicas ≥ RF` | Решение по каждому (п. 2.4) |
 
@@ -802,11 +983,14 @@ less cluster-report-before.md
 * все брокеры из `BROKERS` отвечают через AdminClient;
 * URP = 0, under-min-isr = 0, недоступных партиций и партиций без лидера = 0;
 * нет активных реассайнов;
-* нет ошибок log dirs.
+* нет ошибок log dirs;
+* совпадают на всех брокерах `inter.broker.protocol.version`, `message.max.bytes`,
+  `replica.fetch.max.bytes`, `unclean.leader.election.enable`.
 
 **Предупреждения** (`[WARN]`) работы не блокируют, но решение по каждому надо записать в `REPORT.md`:
-остатки троттлов (снять по п. 6.2 основного плана), лидеры не на preferred-репликах,
-топики с RF ≠ 3, топики с `min.insync.replicas ≥ RF`.
+остатки троттлов от прошлых работ (снять по п. 7.1), лидеры не на preferred-репликах,
+топики с RF ≠ 3, топики с `min.insync.replicas ≥ RF`, расхождения прочих параметров брокеров,
+реплики на брокерах 4 и 5 до начала работ (обычно это топики, созданные после ввода брокеров; план их учтёт).
 
 ### 2.4. Решения по итогам диагностики
 
@@ -944,30 +1128,69 @@ tar czf ~/kafka-rf5-plan-$(date +%Y%m%d-%H%M).tgz -C "$WORKDIR" batches REPORT.m
 
 ## 4. Этап 3. Троттлинг
 
-Подробный расчёт приведён в основном плане, раздел 4. Кратко:
+Троттл задаётся в **байтах в секунду на брокер**, отдельно для отдачи лидером и приёма фолловером.
+Начальное значение:
 
-| Сеть / диск | Стартовый `THROTTLE` |
-|---|---|
-| 1 Gbit/s | 30 МБ/с = `31457280` |
-| 10 Gbit/s | 100 МБ/с = `104857600` |
-| 25 Gbit/s + NVMe | 300 МБ/с = `314572800` |
+```
+THROTTLE = min( 0.3 × пропускная способность сети брокера,
+                0.3 × последовательная скорость записи диска )
+```
 
-Особенность RF 3 → 5: **каждый** из брокеров 4 и 5 принимает **весь** объём пачки. Значит,
-время пачки ≈ `уникальный объём пачки / THROTTLE` (столбец «Оценка времени» в `summary.md` уже
-считает так, с запасом ×1,5).
+| Сеть / диск | Стартовый `THROTTLE` | Комментарий |
+|---|---|---|
+| 1 Gbit/s (≈125 МБ/с) | 30 МБ/с = `31457280` | консервативно, не мешает продюсерам |
+| 10 Gbit/s (≈1250 МБ/с) | 100 МБ/с = `104857600` | можно поднимать до 300 МБ/с при запасе |
+| 25 Gbit/s + NVMe | 300 МБ/с = `314572800` | упирается в диск, а не в сеть |
+
+**Начинать всегда с консервативного значения.** Поднять троттл на лету можно одной командой (ниже),
+а снижать его, когда задержки уже выросли, дороже.
+
+### 4.1. Время пачки
+
+Каждый из брокеров 4 и 5 принимает **весь** объём пачки. Значит:
+
+```
+время пачки ≈ уникальный объём пачки / THROTTLE × 1,5 (запас)
+```
+
+Пример: пачка 300 GiB, троттл 30 МБ/с: `300 × 1024 / 30 ≈ 10 240 с ≈ 2 ч 50 мин`, с запасом около 4 ч 15 мин.
+Столбец «Оценка времени» в `summary.md` считается так же.
+
+### 4.2. Как ставится и снимается троттл
 
 Троттл выставляется **самим `--execute --throttle`** (на брокерах `*.replication.throttled.rate`,
 на топиках пачки `*.replication.throttled.replicas`). Финальный `--verify` без
 `--preserve-throttles` снимает его после каждой пачки. Отдельно задавать троттл через
 `kafka-configs.sh` не нужно.
 
-Изменить троттл **во время** выполнения пачки:
+### 4.3. Изменение троттла во время пачки
 
 ```bash
 kafka-reassign-partitions.sh --bootstrap-server $broker --command-config $config \
   --reassignment-json-file batches/batch-NN.json \
   --execute --additional --throttle 52428800
 ```
+
+Изменение применяется динамически, без рестарта и без перезапуска реассайна.
+
+### 4.4. Если скорость ниже троттла
+
+Посмотрите `ReplicationBytesInPerSec` на брокерах 4 и 5. Если скорость заметно ниже `THROTTLE`,
+узкое место не в троттле:
+
+* утилизация диска и сети: `iostat -x 5 3`, `sar -n DEV 5 3` на брокерах 1–5;
+* число потоков репликации на новых брокерах. Параметр динамический, рестарт не нужен:
+
+  ```bash
+  for id in 4 5; do
+    kafka-configs.sh --bootstrap-server $broker --command-config $config \
+      --entity-type brokers --entity-name $id --alter --add-config num.replica.fetchers=4
+  done
+  ```
+
+  После работ вернуть прежнее значение: `--delete-config num.replica.fetchers`.
+* забытый топиковый или брокерский троттл с меньшим значением (п. 7.1);
+* GC-паузы на брокерах (`gc.log`).
 
 ---
 
@@ -1084,7 +1307,7 @@ chmod +x run-batch.sh
 
 После пилота, перед следующими пачками:
 
-* [ ] время пачки сопоставимо с оценкой в `summary.md` (если сильно медленнее, см. п. 11.1 основного плана);
+* [ ] время пачки сопоставимо с оценкой в `summary.md` (если сильно медленнее, см. п. 4.4 и 11.1);
 * [ ] p99 `Produce TotalTimeMs` и лаг критичных консьюмер-групп вернулись к baseline;
 * [ ] исходящий трафик репликации на лидерах в пределах запаса сети;
 * [ ] решение: оставить `THROTTLE` или поднять.
@@ -1201,7 +1424,27 @@ done
 # ожидаем пустой вывод
 ```
 
-Если что-то осталось, снять вручную по п. 6.2 основного плана.
+Если что-то осталось, снять вручную:
+
+```bash
+K="--bootstrap-server $broker --command-config $config"
+
+# брокерские лимиты
+for id in ${BROKERS//,/ }; do
+  kafka-configs.sh $K --entity-type brokers --entity-name "$id" --alter \
+    --delete-config "leader.replication.throttled.rate,follower.replication.throttled.rate" 2>/dev/null
+done
+
+# топиковые списки throttled.replicas
+kafka-configs.sh $K --entity-type topics --describe \
+  | awk '/configs for topic/ {t=$5} /throttled.replicas=/ {print t}' | sort -u > throttled-topics.list
+while read -r t; do
+  kafka-configs.sh $K --entity-type topics --entity-name "$t" --alter \
+    --delete-config "leader.replication.throttled.replicas,follower.replication.throttled.replicas"
+done < throttled-topics.list
+```
+
+Затем повторить проверку выше.
 
 ### 7.2. Лидеры
 
@@ -1349,19 +1592,52 @@ echo "| $n | | | $(date '+%F %T') | | ОТКАТ выполнен |" >> REPORT.m
 |---|---|---|
 | `--generate` ругается на топик | `UnknownTopicOrPartitionException` | Топик удалили после диагностики: убрать его из `topics-NN.json` и перезапустить подготовку этой пачки |
 | `expand` пишет `набор партиций различается` | — | Топику добавили партиции после диагностики: заново сделать `./diagnose.sh before` и `prepare-batches.sh` в новом каталоге `batches` |
-| Пачка висит на последних партициях | `still in progress` не уменьшается | Остатки троттла или реплика на 4/5 не входит в ISR. Разбор по п. 11.1 основного плана |
+| Пачка висит на последних партициях | `still in progress` не уменьшается | Слишком низкий или забытый троттл, реплика на 4/5 не входит в ISR. Разбор по п. 11.1 |
 | После пачки URP ≠ 0 | в `progress.log` `URP>0` | Не запускать следующую. Найти партиции: `kafka-topics.sh … --under-replicated-partitions` |
 | Место на 4/5 кончается | `df`, `kafka-log-dirs.sh` | `--cancel` текущей пачки; пересмотреть решение по RF=5 или расширить диски |
 | Выросла p99 записи | метрики `Produce TotalTimeMs` | Снизить `THROTTLE` (п. 4). После завершения всех пачек задержка должна частично вернуться, но `acks=all` при RF=5 всегда немного медленнее |
-| `ClusterAuthorizationException` | на `--execute` | Нет прав `Alter` на `Cluster`: таблица прав в п. 1.0 основного плана |
+| `ClusterAuthorizationException` | на `--execute` | Нет прав `Alter` на `Cluster`: таблица прав в п. 1.2 |
+| Реплика на 4/5 не входит в ISR | URP не уходит, `MaxLag` растёт | `replica.fetch.max.bytes` на новом брокере меньше `message.max.bytes` топика: выровнять конфиги (таблица параметров в отчёте диагностики), перезапустить фолловер |
+| Скорость копирования взлетела посреди пачки | `ReplicationBytesInPerSec` ≫ `THROTTLE` | Троттл снят досрочно обычным `--verify`: вернуть командой из п. 4.3 |
+| Консьюмеры уходят в ребаланс | группы в `PreparingRebalance` | Идёт пачка `__consumer_offsets`: нормально на короткое время; следующую пачку запускать, когда группы вернутся в `Stable` |
+| Медленные операции с метаданными | задержки `--describe`, контроллер перегружен | Слишком много партиций в пачке: уменьшить `MAX_PARTS` и пересобрать ещё не выполненные пачки |
+| `--verify`: `…rather than…` | `run-batch.sh` остановился с ошибкой verify | Брокер-приёмник был недоступен или реассайн отменён: проверить брокеры 4/5, затем повторить пачку (`./run-batch.sh NN`) |
+
+### 11.1. Диагностика зависшей пачки
+
+```bash
+K="--bootstrap-server $broker --command-config $config"
+
+# 1. Что сейчас переназначается
+kafka-reassign-partitions.sh $K --list
+
+# 2. Действующие троттлы: нет ли неожиданно низкого значения
+for id in ${BROKERS//,/ }; do
+  echo "broker $id: $(kafka-configs.sh $K --entity-type brokers --entity-name $id --describe | grep -o '[a-z.]*throttled.rate=[0-9]*' | tr '\n' ' ')"
+done
+
+# 3. Ошибки фолловеров на новых брокерах
+ssh broker4 "grep -iE 'ReplicaFetcher|Truncat|OutOfRange|ERROR' /var/log/kafka/server.log | tail -40"
+
+# 4. Фактическая скорость приёма (JMX на broker4/broker5):
+#    kafka.server:type=BrokerTopicMetrics,name=ReplicationBytesInPerSec
+
+# 5. Железо
+ssh broker4 "iostat -x 5 3; sar -n DEV 5 3; df -h ${KAFKA_DATA_DIR:-/kafka/data}"
+```
+
+Если причину устранить не удаётся, отменить пачку (`--cancel`, п. 5.5): кластер вернётся к
+состоянию до пачки.
 
 ---
 
 ## 12. Итоговый чек-лист
 
 **Подготовка**
-- [ ] Переменные заданы, доступ проверен (п. 1.1)
-- [ ] Рабочий каталог, `rf5tool.py` создан (п. 1.2–1.3)
+- [ ] Переменные заданы, доступ и права проверены (п. 1.1–1.2)
+- [ ] Брокеры 4 и 5 готовы: адреса, сеть, диски (п. 1.3)
+- [ ] Базовые значения метрик сняты, организационные пункты выполнены (п. 1.4–1.5)
+- [ ] Рабочий каталог, `rf5tool.py` создан (п. 1.6–1.7)
 - [ ] Последствия RF=5 приняты: место, сеть, `acks=all` (п. 0)
 
 **Этап 1 — диагностика**
