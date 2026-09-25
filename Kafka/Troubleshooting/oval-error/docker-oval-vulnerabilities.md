@@ -482,6 +482,93 @@ diff ~/oval-<dev>.sha256 ~/oval-<test>.sha256
    Это не решение: dpkg про эту ссылку не знает, а формат базы 1.2.2 может не подходить сканеру ci5. Для dev допустимо, чтобы подтвердить причину, дальше всё равно вариант 1.
 4. **Обновить `docker.io` на dev до 29.x из репозитория** (там `oval-db` 1.2.2 и docker, вероятно, согласованы). Это смена мажорной версии, поэтому сначала проверить на test и согласовать.
 
+### Обновление `docker.io` на dev до ci6 (как на test)
+
+Цель: на dev `docker.io 25.0.5.astra2+ci6`, как на test. Версии ci6 в репозиториях dev нет, поэтому пакет берётся с test.
+
+**Шаг 1. На test: откуда пакет и с чем он работает**
+
+```bash
+apt policy docker.io                      # источник ci6: репозиторий или только /var/lib/dpkg/status
+grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/
+ls -la /var/cache/apt/archives/docker.io_* 2>/dev/null
+grep -E ' (install|upgrade) docker.io' /var/log/dpkg.log* 2>/dev/null
+zgrep -E ' (install|upgrade) docker.io' /var/log/dpkg.log.*.gz 2>/dev/null
+dpkg -s docker.io | grep -E '^(Version|Depends|Pre-Depends|Breaks|Conflicts)'
+dpkg -l containerd runc tini docker-buildx docker-compose-v2 2>/dev/null | awk '/^ii/ {print $2, $3}'
+```
+
+По результату выбрать способ получения пакета.
+
+**Шаг 2. Получить пакет ci6**
+
+- **A. В `apt policy` на test ci6 идёт из репозитория** (например, другое обновление Astra или другое зеркало): подключить этот же репозиторий на dev, сделать `apt update` и проверить `apt policy docker.io`, что `25.0.5.astra2+ci6` появился.
+- **B. На test в кэше apt есть `.deb`:** скопировать его на dev.
+
+  ```bash
+  # на test
+  scp /var/cache/apt/archives/docker.io_25.0.5.astra2+ci6_amd64.deb <dev>:/tmp/
+  ```
+
+- **C. `.deb` нигде нет:** пересобрать пакет из установленных файлов на test через `dpkg-repack`. Это крайний вариант: у пакета не будет подписи Astra, в сертифицированном контуре это согласовать с ИБ.
+
+  ```bash
+  # на test
+  sudo apt install dpkg-repack
+  cd /tmp && sudo dpkg-repack docker.io
+  scp /tmp/docker.io_25.0.5.astra2+ci6_amd64.deb <dev>:/tmp/
+  ```
+
+**Шаг 3. На dev: подготовка**
+
+```bash
+# зависимости нового пакета и что поменяется (ничего не ставит)
+dpkg -I /tmp/docker.io_25.0.5.astra2+ci6_amd64.deb | grep -E 'Version|Depends|Breaks|Conflicts'
+sudo apt install -s /tmp/docker.io_25.0.5.astra2+ci6_amd64.deb | grep -E '^(Inst|Remv)'   # для варианта A: sudo apt install -s docker.io=25.0.5.astra2+ci6
+
+# резервная копия конфигурации
+sudo cp -a /etc/docker /etc/docker.bak.$(date +%F)
+sudo cp -a /usr/share/oval/conf /root/oval-conf.bak.$(date +%F)
+```
+
+В выводе `-s` должно быть только `Inst docker.io [25.0.5.astra2+ci5] (25.0.5.astra2+ci6 ...)`. Если apt хочет поставить docker.io 29.x, обновить или удалить `containerd`/`runc` и т.п., остановиться и сверить версии зависимостей с test (шаг 1).
+
+**Шаг 4. На dev: установка (в окно работ, docker перезапустится)**
+
+```bash
+sudo apt-mark unhold docker.io 2>/dev/null
+sudo apt install /tmp/docker.io_25.0.5.astra2+ci6_amd64.deb     # вариант A: sudo apt install docker.io=25.0.5.astra2+ci6
+sudo apt-mark hold docker.io                                     # чтобы apt upgrade не поднял до 29.x
+dpkg -l docker.io oval-db | awk '/^ii/ {print $2, $3}'
+sudo systemctl restart docker
+systemctl is-active docker
+```
+
+**Шаг 5. Проверка**
+
+```bash
+docker load < ~/08.containers/dockge-latest.tar.gz
+docker image ls
+cid=$(docker create <образ>) && docker start $cid && echo "OK: контейнер стартовал"
+docker rm -f $cid
+sudo journalctl -u docker --since "10 min ago" | grep -iE 'ScanService|oval|permission denied|error'
+```
+
+- `docker load` проходит и контейнер стартует: проблема решена, записать итог.
+- Снова `permission denied` в `overlay2`: вернуться к разделу про permission denied (МКЦ, метки `/var/lib/docker`).
+- Ошибка OVAL с реальными уязвимостями (`true`, а не `error`): это уже настоящие находки, см. «Варианты решения» (пересборка образа, `scan-whitelist`).
+
+**Откат**
+
+```bash
+sudo apt-mark unhold docker.io
+sudo apt install docker.io=25.0.5.astra2+ci5   # если ci5 есть в кэше apt: sudo apt install /var/cache/apt/archives/docker.io_25.0.5.astra2+ci5_amd64.deb
+sudo cp -a /etc/docker.bak.<дата>/. /etc/docker/
+sudo systemctl restart docker
+```
+
+Перед установкой убедиться, что `.deb` ci5 для отката доступен: `ls /var/cache/apt/archives/docker.io_*`. Если его нет, заранее сделать `sudo dpkg-repack docker.io` на dev.
+
 **Опыт с `astra-sec-level` на dev (если обновление пакетов не помогло)**
 
 Проверить, что проверка зависит от этого параметра. Делать в окно работ: перезапуск docker остановит контейнеры на dev.
@@ -581,6 +668,8 @@ docker info >/dev/null && echo "docker поднялся"
 | 25.09.2026 | dev | `ls -laR /usr/share/oval/{db,conf,scan-whitelist}` | база по версиям Astra и критичности (`*Severity.xml` + `manifest.json`), `conf/docker.json`, `conf/podman.json`, `scan-whitelist.db` (SQLite?); `db.xml` нет |
 | 25.09.2026 | test | то же `ls -laR /usr/share/oval/...` | полностью совпадает с dev: те же файлы, размеры и даты, `db.xml` нет. Разница между хостами — только `docker.io` ci5 (dev) / ci6 (test) |
 |      | dev/test | `sha256sum` по `/usr/share/oval` |  |
+|      | test | источник `docker.io` ci6 (`apt policy`, кэш, `dpkg.log`) |  |
+|      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
 |      | dev/test | путь к базе в бинарнике демона |  |
 |      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
