@@ -739,6 +739,56 @@ DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d
 
    Это обходной путь: Astra, возможно, намеренно перенесла сокет (права, мандатные метки). Сначала проверить права на `/run/docker/` и согласовать с ИБ.
 
+   **Результат на dev:** ссылка через `tmpfiles.d` (`L /run/docker.sock ...`) не помогла. Без `DOCKER_HOST` `docker compose up -d` по-прежнему выдаёт `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`.
+
+   Вероятная причина: тип `L` в `tmpfiles.d` **не заменяет существующий файл**. Если после `docker.io` 25.0.5 остался старый файл сокета `/run/docker.sock` (его никто не слушает), ссылка не создаётся, и клиент стучится в мёртвый сокет. Проверить:
+
+   ```bash
+   ls -la /var/run /run/docker.sock /run/docker/docker.sock
+   stat -c '%F %N' /run/docker.sock
+   sudo ss -xlp | grep -E 'docker\.sock'
+   curl -s --unix-socket /var/run/docker.sock http://localhost/_ping; echo
+   curl -s --unix-socket /run/docker/docker.sock http://localhost/_ping; echo
+   ```
+
+   - `stat` показывает `socket`, а не `symbolic link`: это старый сокет. Заменить его ссылкой через `L+` (удаляет существующий файл):
+
+     ```bash
+     sudo sed -i 's/^L /L+ /' /etc/tmpfiles.d/docker-sock-compat.conf
+     sudo systemd-tmpfiles --create /etc/tmpfiles.d/docker-sock-compat.conf
+     stat -c '%F %N' /run/docker.sock        # symbolic link '/run/docker.sock' -> '/run/docker/docker.sock'
+     docker compose up -d                     # без DOCKER_HOST
+     ```
+
+   - Ссылка есть, но `_ping` через неё не отвечает, а напрямую отвечает: смотреть `dmesg`/`journalctl -k` на отказы PARSEC при переходе по ссылке и права на `/run/docker/`.
+
+4. **Второй адрес для `docker.socket` (вместо ссылки).** Демон запускается с `-H fd://` и принимает сокеты от systemd, поэтому `docker.socket` может слушать сразу два пути:
+
+   ```bash
+   sudo systemctl edit docker.socket
+   ```
+
+   ```ini
+   [Socket]
+   ListenStream=/run/docker.sock
+   ```
+
+   ```bash
+   sudo rm -f /etc/tmpfiles.d/docker-sock-compat.conf /run/docker.sock
+   sudo systemctl daemon-reload
+   sudo systemctl restart docker.socket docker.service
+   systemctl status docker.socket | grep Listen
+   docker compose up -d
+   ```
+
+   Права на второй сокет берутся из того же `docker.socket` (`SocketMode`, `SocketGroup`). Перезапуск docker остановит контейнеры без `restart:` — в окно работ. Согласовать с ИБ так же, как ссылку.
+
+5. **`DOCKER_HOST` для всех пользователей** — самый простой вариант, работает только в login-shell (не для служб и cron):
+
+   ```bash
+   echo 'export DOCKER_HOST=unix:///run/docker/docker.sock' | sudo tee /etc/profile.d/docker-host.sh
+   ```
+
 **Результат: `docker-compose-v2` уже стоит последней версии (29.1.2.astra1+ci5)**
 
 Вариант 1 не помогает: в репозиториях нет `docker-compose-v2` новее 29.1.2+ci5, а эта версия ищет старый `/var/run/docker.sock`.
@@ -868,7 +918,8 @@ docker info >/dev/null && echo "docker поднялся"
 | 25.09.2026 | dev | `docker-compose-v2` | уже стоит последняя 29.1.2.astra1+ci5, путь к сокету старый; обновление compose не решает |
 |      | dev | контекст / ссылка на сокет / откат `docker.io` до 29.1.2+ci5 |  |
 | 25.09.2026 | dev | `/opt/dockge/compose.yml`: `- /run/docker/docker.sock:/var/run/docker.sock` | прописано; `docker compose up -d` без `DOCKER_HOST` по-прежнему `Cannot connect ... unix:///var/run/docker.sock`: ожидаемо, монтирование не влияет на то, куда подключается сам compose |
-|      | dev | контекст docker или ссылка `tmpfiles.d` |  |
+| 25.09.2026 | dev | ссылка `tmpfiles.d` (`L /run/docker.sock -> /run/docker/docker.sock`) | не помогло: без `DOCKER_HOST` та же ошибка |
+|      | dev | `stat /run/docker.sock` (старый сокет?), `L+` / второй `ListenStream` / `profile.d` |  |
 |      | dev | сканер OVAL в 29.5.1 работает (блокирует уязвимый образ) |  |
 |      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
