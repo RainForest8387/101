@@ -655,6 +655,125 @@ journalctl -u docker --since "5 min ago" | grep -iE 'oval|vulnerab|sec-level|err
 
 > `astra-sec-level` работает только если на хосте включён соответствующий режим защиты (МКЦ). Если демон не стартует с этим параметром, смотреть `journalctl -u docker` и сравнивать режим ОС с test.
 
+### dev: обновление `docker.io` до 29.5.1 и новая ошибка `docker compose`
+
+На dev выполнено `apt install --only-upgrade docker.io`, пакет обновился до кандидата из `repository-update`: **29.5.1.astra1+ci1b1** (а не ci6, как на test). После этого `docker load` прошёл без ошибок OVAL:
+
+```
+dockerd: msg="Docker daemon" ... storage-driver=overlay2 version=29.5.1.astra1
+dockerd: msg="API listen on /run/docker/docker.sock"
+dockerd_audit: dockerd.audit|1021|<user>|...|image.load|success|id=N/A
+```
+
+Но `docker compose` не подключается к демону:
+
+```
+/opt/dockge$ docker compose up -d
+WARN[0000] /opt/dockge/compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion
+unable to get image 'proxy-nexus.mcb.ru/louislam/dockge': Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+```
+
+При этом `docker.service` и `docker.socket` активны:
+
+```
+docker.socket ... Listen: /run/docker/docker.sock (Stream)
+```
+
+Что из этого следует:
+
+- **В сборке 29.5.1 от Astra сокет демона переехал** со стандартного `/var/run/docker.sock` (= `/run/docker.sock`) на **`/run/docker/docker.sock`**.
+- Клиент `docker` из того же пакета знает новый путь (`docker load` работает). **Плагин `docker compose` — из другого пакета** (на dev стоял `docker-compose` 1.29.2, на test `docker-compose-v2` 29.1.2.astra1+ci5) и по умолчанию идёт на старый `/var/run/docker.sock`.
+- Предупреждение про `version` в `compose.yml` на работу не влияет. Строку `version:` можно просто удалить.
+- **dev и test теперь расходятся:** на dev `docker.io` 29.5.1, на test 25.0.5 ci6. Это нужно учитывать и либо обновить test так же (после проверки на dev), либо помнить про разницу.
+
+**Диагностика**
+
+```bash
+ls -la /run/docker/docker.sock /var/run/docker.sock /run/docker.sock 2>&1
+echo "DOCKER_HOST=$DOCKER_HOST"
+docker context ls
+docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'
+docker compose version
+# чей плагин compose и чей бинарник docker-compose
+for f in /usr/libexec/docker/cli-plugins/docker-compose /usr/lib/docker/cli-plugins/docker-compose \
+         /usr/local/lib/docker/cli-plugins/docker-compose ~/.docker/cli-plugins/docker-compose; do
+  [ -e "$f" ] && { ls -la "$f"; dpkg -S "$f" 2>/dev/null || echo "  не из пакета"; }
+done
+dpkg -l | awk '/^ii/ && $2 ~ /docker/ {print $2, $3}'
+apt policy docker-compose-v2
+```
+
+Быстрая проверка, что дело только в пути к сокету:
+
+```bash
+DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d
+```
+
+**Варианты решения**
+
+1. **Поставить `docker-compose-v2` из репозитория Astra** (как на test), подходящий к `docker.io` 29.x. Сборка Astra, скорее всего, знает новый путь. Старый `docker-compose` 1.29.2 удалить, если он больше не нужен. Предпочтительный вариант.
+
+   ```bash
+   apt policy docker-compose-v2
+   sudo apt install -s docker-compose-v2 | grep -E '^(Inst|Remv)'
+   sudo apt install docker-compose-v2
+   docker compose version
+   ```
+
+2. **Указать путь к сокету в контексте docker** (для пользователя, без правки системы):
+
+   ```bash
+   docker context create astra --docker host=unix:///run/docker/docker.sock
+   docker context use astra
+   ```
+
+   Либо переменной окружения в профиле: `export DOCKER_HOST=unix:///run/docker/docker.sock`. Действует только для этого пользователя и shell'а. Службы и скрипты, которые вызывают compose, её не увидят.
+
+3. **Ссылка со старого пути на новый** (для всех клиентов). `/run` очищается при перезагрузке, поэтому через `tmpfiles.d`:
+
+   ```bash
+   echo 'L /run/docker.sock - - - - /run/docker/docker.sock' | sudo tee /etc/tmpfiles.d/docker-sock-compat.conf
+   sudo systemd-tmpfiles --create /etc/tmpfiles.d/docker-sock-compat.conf
+   ls -la /var/run/docker.sock
+   ```
+
+   Это обходной путь: Astra, возможно, намеренно перенесла сокет (права, мандатные метки). Сначала проверить права на `/run/docker/` и согласовать с ИБ.
+
+**Результат: `docker-compose-v2` уже стоит последней версии (29.1.2.astra1+ci5)**
+
+Вариант 1 не помогает: в репозиториях нет `docker-compose-v2` новее 29.1.2+ci5, а эта версия ищет старый `/var/run/docker.sock`.
+
+- Версии `docker-compose-v2` 29.1.2.astra1+ci5 и `docker.io` 29.1.2.astra1+ci5 (repository-base) — **одна серия сборок**. `docker.io` 29.5.1 в `repository-update` вышел без обновлённого compose, поэтому клиент и плагин разошлись по пути к сокету.
+- Плагин compose — отдельный бинарник со своим путём по умолчанию. Путь, зашитый в клиент `docker`, он не наследует, но читает `DOCKER_HOST` и текущий контекст docker (`~/.docker/config.json`).
+
+Рабочие варианты:
+
+- **Контекст (вариант 2)** — для пользователей, которые запускают `docker compose` вручную.
+- **Ссылка через `tmpfiles.d` (вариант 3)** — если compose запускают разные пользователи или службы.
+- **Откатить `docker.io` до 29.1.2.astra1+ci5** (repository-base), в пару к compose той же версии. Перед этим проверить, где у 29.1.2 сокет и работает ли она с `oval-db` 1.2.2. Если на обоих хостах переходить на 29.x, пара 29.1.2+29.1.2 выглядит согласованнее всего.
+
+  ```bash
+  sudo apt install -s docker.io=29.1.2.astra1+ci5 | grep -E '^(Inst|Remv)'
+  ```
+
+**Важно для dockge:** dockge управляет docker через сокет, примонтированный в контейнер. В `compose.yml` обычно есть `/var/run/docker.sock:/var/run/docker.sock`. При новом пути:
+
+- в любом случае (со ссылкой из варианта 3 или без неё) монтировать реальный путь: `- /run/docker/docker.sock:/var/run/docker.sock`. Путь внутри контейнера оставить прежним, dockge ищет сокет там.
+
+```bash
+grep -n 'docker.sock' /opt/dockge/compose.yml
+```
+
+**Проверить после обновления**
+
+- **Проверка по OVAL в 29.5.1 работает, а не отключилась.** В логе при `docker load` больше нет строк `ScanService`. Проверить, что сканер работает: загрузить заведомо уязвимый образ (например, старый образ с известными CVE) и убедиться, что он блокируется.
+
+  ```bash
+  sudo journalctl -u docker --since "30 min ago" | grep -iE 'scan|oval'
+  ```
+
+- `apt-mark hold docker.io` уже не нужен для защиты от 29.x, но стоит закрепить версию, чтобы dev не уехал дальше test без плана.
+
 ### Варианты решения
 
 **1. Пересобрать образ на базовом образе Astra (рекомендуется)**
@@ -734,6 +853,13 @@ docker info >/dev/null && echo "docker поднялся"
 | 25.09.2026 | test | `ls /var/cache/apt/archives/docker.io_*` | пусто, `.deb` в кэше нет |
 |      | test | пул зеркала на `docker.io_25.0.5.astra2+ci6` |  |
 |      | test | `dpkg-repack docker.io` (если в пуле нет) |  |
+| 25.09.2026 | dev | `apt install --only-upgrade docker.io` | обновлён до 29.5.1.astra1+ci1b1; `docker load` прошёл без ошибок OVAL |
+| 25.09.2026 | dev | `docker compose up -d` | `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`; демон слушает `/run/docker/docker.sock` |
+|      | dev | `DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d` |  |
+| 25.09.2026 | dev | `docker-compose-v2` | уже стоит последняя 29.1.2.astra1+ci5, путь к сокету старый; обновление compose не решает |
+|      | dev | контекст / ссылка на сокет / откат `docker.io` до 29.1.2+ci5 |  |
+|      | dev | путь к сокету в `/opt/dockge/compose.yml` |  |
+|      | dev | сканер OVAL в 29.5.1 работает (блокирует уязвимый образ) |  |
 |      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
 |      | dev/test | путь к базе в бинарнике демона |  |
