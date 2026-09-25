@@ -855,7 +855,7 @@ docker info >/dev/null && echo "docker поднялся"
 |      | test | `dpkg-repack docker.io` (если в пуле нет) |  |
 | 25.09.2026 | dev | `apt install --only-upgrade docker.io` | обновлён до 29.5.1.astra1+ci1b1; `docker load` прошёл без ошибок OVAL |
 | 25.09.2026 | dev | `docker compose up -d` | `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`; демон слушает `/run/docker/docker.sock` |
-|      | dev | `DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d` |  |
+| 25.09.2026 | dev | `DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d` | работает: причина только в пути к сокету |
 | 25.09.2026 | dev | `docker-compose-v2` | уже стоит последняя 29.1.2.astra1+ci5, путь к сокету старый; обновление compose не решает |
 |      | dev | контекст / ссылка на сокет / откат `docker.io` до 29.1.2+ci5 |  |
 |      | dev | путь к сокету в `/opt/dockge/compose.yml` |  |
@@ -868,4 +868,18 @@ docker info >/dev/null && echo "docker поднялся"
 
 ### Итог
 
-_Заполнить после диагностики: причина, выбранный вариант, что изменено._
+**Причина исходной ошибки на dev.** `oval-db` на dev была сильно устаревшей (0.0.2.astra1+ci3, на test 1.2.2+ci2). Проверки OVAL заканчивались результатом `error`, а демон считает его уязвимостью и блокирует образ. Сам образ, судя по этому, уязвимостей не содержал.
+
+**Что сделано на dev (25.09.2026):**
+
+1. `oval-db` обновлён до 1.2.2+ci2. В нём новая структура базы (`/usr/share/oval/db/astra/<версия>/*Severity.xml`), а `docker.io` 25.0.5 ci5 её не понимал: `database not exists in /usr/share/oval/db.xml`.
+2. `docker.io` обновлён до 29.5.1.astra1+ci1b1 (`apt install --only-upgrade docker.io`). Ошибки OVAL при `docker load` больше нет.
+3. В 29.5.1 сокет демона переехал в `/run/docker/docker.sock`. `docker-compose-v2` 29.1.2+ci5 (последний в репозитории) ищет старый `/var/run/docker.sock`. С `DOCKER_HOST=unix:///run/docker/docker.sock` `docker compose up -d` работает.
+
+**Осталось сделать:**
+
+- [ ] Закрепить путь к сокету для compose: контекст docker для пользователей или ссылка через `tmpfiles.d` для всех (согласовать с ИБ).
+- [ ] В `/opt/dockge/compose.yml` монтировать `/run/docker/docker.sock:/var/run/docker.sock`, проверить, что dockge видит стеки.
+- [ ] Проверить, что сканер OVAL в 29.5.1 действительно работает (уязвимый образ блокируется).
+- [ ] Решить судьбу test: он остаётся на `docker.io` 25.0.5 ci6. Обновить так же после проверки на dev или закрепить версии на обоих хостах (`apt-mark hold`).
+- [ ] Удалить строку `version:` из `compose.yml` (предупреждение, на работу не влияет).
