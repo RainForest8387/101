@@ -764,6 +764,15 @@ DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d
 grep -n 'docker.sock' /opt/dockge/compose.yml
 ```
 
+Это две **разные** настройки, и нужны обе:
+
+| Что | Где задаётся | На что влияет |
+|---|---|---|
+| куда подключается `docker compose` (клиент на хосте) | `DOCKER_HOST`, контекст docker или ссылка `/run/docker.sock` | запуск `docker compose up -d` |
+| какой сокет видит dockge внутри контейнера | `volumes:` в `compose.yml` | управление стеками из веб-интерфейса dockge |
+
+Правка `volumes:` в `compose.yml` не лечит ошибку `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` при `docker compose up -d`. Для этого нужен контекст (вариант 2) или ссылка (вариант 3).
+
 **Проверить после обновления**
 
 - **Проверка по OVAL в 29.5.1 работает, а не отключилась.** В логе при `docker load` больше нет строк `ScanService`. Проверить, что сканер работает: загрузить заведомо уязвимый образ (например, старый образ с известными CVE) и убедиться, что он блокируется.
@@ -858,7 +867,8 @@ docker info >/dev/null && echo "docker поднялся"
 | 25.09.2026 | dev | `DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d` | работает: причина только в пути к сокету |
 | 25.09.2026 | dev | `docker-compose-v2` | уже стоит последняя 29.1.2.astra1+ci5, путь к сокету старый; обновление compose не решает |
 |      | dev | контекст / ссылка на сокет / откат `docker.io` до 29.1.2+ci5 |  |
-|      | dev | путь к сокету в `/opt/dockge/compose.yml` |  |
+| 25.09.2026 | dev | `/opt/dockge/compose.yml`: `- /run/docker/docker.sock:/var/run/docker.sock` | прописано; `docker compose up -d` без `DOCKER_HOST` по-прежнему `Cannot connect ... unix:///var/run/docker.sock`: ожидаемо, монтирование не влияет на то, куда подключается сам compose |
+|      | dev | контекст docker или ссылка `tmpfiles.d` |  |
 |      | dev | сканер OVAL в 29.5.1 работает (блокирует уязвимый образ) |  |
 |      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
