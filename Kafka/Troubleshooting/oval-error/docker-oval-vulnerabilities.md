@@ -760,6 +760,22 @@ DOCKER_HOST=unix:///run/docker/docker.sock docker compose up -d
      docker compose up -d                     # без DOCKER_HOST
      ```
 
+   **Подтверждено на dev (25.09.2026):**
+
+   ```
+   srw-rw---- 1 root docker 0 сен 25 23:07 /run/docker/docker.sock
+   srw-rw---- 1 root docker 0 сен  2 03:12 /run/docker.sock        <- старый сокет, не ссылка
+   lrwxrwxrwx 1 root root   4 июл 27  2023 /var/run -> /run
+   $ stat -c '%F %N' /run/docker.sock
+   сокет '/run/docker.sock'
+   $ curl -s --unix-socket /var/run/docker.sock http://localhost/_ping     -> пусто
+   $ curl -s --unix-socket /run/docker/docker.sock http://localhost/_ping  -> OK
+   $ sudo ss -xlp | grep docker.sock
+   u_str LISTEN ... /run/docker/docker.sock ... users:(("dockerd",pid=3501682,fd=15),("systemd",pid=1,fd=147))
+   ```
+
+   `/run/docker.sock` от 2 сен остался от `docker.io` 25.0.5. Его никто не слушает, поэтому `tmpfiles.d` с `L` ссылку не создал. Решение: `L+` (ниже) или второй `ListenStream` (вариант 4).
+
    - Ссылка есть, но `_ping` через неё не отвечает, а напрямую отвечает: смотреть `dmesg`/`journalctl -k` на отказы PARSEC при переходе по ссылке и права на `/run/docker/`.
 
 4. **Второй адрес для `docker.socket` (вместо ссылки).** Демон запускается с `-H fd://` и принимает сокеты от systemd, поэтому `docker.socket` может слушать сразу два пути:
@@ -919,7 +935,8 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev | контекст / ссылка на сокет / откат `docker.io` до 29.1.2+ci5 |  |
 | 25.09.2026 | dev | `/opt/dockge/compose.yml`: `- /run/docker/docker.sock:/var/run/docker.sock` | прописано; `docker compose up -d` без `DOCKER_HOST` по-прежнему `Cannot connect ... unix:///var/run/docker.sock`: ожидаемо, монтирование не влияет на то, куда подключается сам compose |
 | 25.09.2026 | dev | ссылка `tmpfiles.d` (`L /run/docker.sock -> /run/docker/docker.sock`) | не помогло: без `DOCKER_HOST` та же ошибка |
-|      | dev | `stat /run/docker.sock` (старый сокет?), `L+` / второй `ListenStream` / `profile.d` |  |
+| 25.09.2026 | dev | `stat /run/docker.sock`, `ss -xlp`, `_ping` | `/run/docker.sock` — старый сокет от 2 сен, никто не слушает; `/run/docker/docker.sock` отвечает `OK` |
+|      | dev | `L+` в `tmpfiles.d` или второй `ListenStream` |  |
 |      | dev | сканер OVAL в 29.5.1 работает (блокирует уязвимый образ) |  |
 |      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
