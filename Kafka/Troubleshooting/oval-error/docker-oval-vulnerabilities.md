@@ -500,6 +500,67 @@ dpkg -l containerd runc tini docker-buildx docker-compose-v2 2>/dev/null | awk '
 
 По результату выбрать способ получения пакета.
 
+**Результат на test: `apt policy docker.io`**
+
+```
+docker.io:
+  Установлен: 25.0.5.astra2+ci6
+  Кандидат:   29.5.1.astra1+ci1b1
+  Таблица версий:
+     29.5.1.astra1+ci1b1 900  .../1.7_x86-64/repository-update
+     29.1.2.astra1+ci5   900  .../1.7_x86-64/repository-base
+ *** 25.0.5.astra2+ci6   100  /var/lib/dpkg/status
+     20.10.2+dfsg1-2astra.se6 900  .../1.7_x86-64/repository-main
+```
+
+- ci6 есть только в `/var/lib/dpkg/status`: **ни в одном подключённом репозитории test её сейчас нет**. Скорее всего, её ставили из `repository-update`, когда там была эта версия, а потом зеркало обновилось до 29.5.1. Способ A (подключить репозиторий) отпадает.
+- Репозитории на test и dev одинаковые (то же зеркало `astra-repo.mcb.ru`, те же версии).
+- Остаются способы: взять `.deb` из кэша apt на test (B), найти ci6 в пуле зеркала или во frozen-репозитории Astra, либо сделать `dpkg-repack` (C).
+
+Проверить на test, есть ли `.deb` в кэше:
+
+```bash
+ls -la /var/cache/apt/archives/docker.io_*
+```
+
+Поискать ci6 в пуле зеркала: в каталоге `pool` иногда остаются старые версии, даже если в индексе их уже нет.
+
+```bash
+for r in repository-update repository-base; do
+  curl -s https://astra-repo.mcb.ru/dl.astralinux.ru/astra/stable/1.7_x86-64/$r/pool/main/d/docker.io/ \
+    | grep -oE 'docker\.io_[^"<]+\.deb' | sort -u
+done
+```
+
+Если в пуле есть `docker.io_25.0.5.astra2+ci6_amd64.deb`, скачать его на dev (`curl -O`, `wget`). Это оригинальный подписанный пакет Astra, поэтому такой вариант лучше, чем `dpkg-repack`. Если нет, спросить у администраторов зеркала или посмотреть frozen-репозитории Astra для версии 1.7.x, установленной на test (`cat /etc/astra_version`).
+
+Кэш apt на test пуст (проверено 25.09.2026), поэтому способ B отпадает.
+
+**Если в пуле ci6 нет: `dpkg-repack` на test**
+
+`dpkg-repack` собирает `.deb` из установленных файлов пакета. В пакет попадут текущие версии конфигурационных файлов (conffiles). Поэтому сначала проверить, что файлы пакета на test не изменены:
+
+```bash
+# на test
+sudo dpkg --verify docker.io          # пустой вывод = файлы как в оригинальном пакете
+dpkg-query -W -f='${Conffiles}\n' docker.io
+apt policy dpkg-repack
+sudo apt install dpkg-repack
+mkdir -p ~/repack && cd ~/repack && sudo dpkg-repack docker.io
+ls -la ~/repack
+dpkg -I ~/repack/docker.io_25.0.5.astra2+ci6_amd64.deb | grep -E 'Version|Depends'
+```
+
+На dev перед установкой так же собрать пакет текущей ci5 для отката:
+
+```bash
+# на dev
+sudo apt install dpkg-repack
+mkdir -p ~/repack && cd ~/repack && sudo dpkg-repack docker.io   # docker.io_25.0.5.astra2+ci5_amd64.deb
+```
+
+Затем перенести `.deb` ci6 с test на dev и выполнить шаги 3–5 ниже. Пакет без подписи Astra: в сертифицированном контуре согласовать с ИБ.
+
 **Шаг 2. Получить пакет ci6**
 
 - **A. В `apt policy` на test ci6 идёт из репозитория** (например, другое обновление Astra или другое зеркало): подключить этот же репозиторий на dev, сделать `apt update` и проверить `apt policy docker.io`, что `25.0.5.astra2+ci6` появился.
@@ -668,7 +729,11 @@ docker info >/dev/null && echo "docker поднялся"
 | 25.09.2026 | dev | `ls -laR /usr/share/oval/{db,conf,scan-whitelist}` | база по версиям Astra и критичности (`*Severity.xml` + `manifest.json`), `conf/docker.json`, `conf/podman.json`, `scan-whitelist.db` (SQLite?); `db.xml` нет |
 | 25.09.2026 | test | то же `ls -laR /usr/share/oval/...` | полностью совпадает с dev: те же файлы, размеры и даты, `db.xml` нет. Разница между хостами — только `docker.io` ci5 (dev) / ci6 (test) |
 |      | dev/test | `sha256sum` по `/usr/share/oval` |  |
-|      | test | источник `docker.io` ci6 (`apt policy`, кэш, `dpkg.log`) |  |
+| 25.09.2026 | test | `apt policy docker.io` | ci6 только в `/var/lib/dpkg/status`, в репозиториях нет (кандидат 29.5.1, base 29.1.2+ci5) |
+| 25.09.2026 | dev | `apt policy docker.io` | установлен ci5 (только `dpkg/status`); репозитории и кандидаты те же, что на test |
+| 25.09.2026 | test | `ls /var/cache/apt/archives/docker.io_*` | пусто, `.deb` в кэше нет |
+|      | test | пул зеркала на `docker.io_25.0.5.astra2+ci6` |  |
+|      | test | `dpkg-repack docker.io` (если в пуле нет) |  |
 |      | dev | установка `docker.io` ci6, `apt-mark hold`, `docker load` |  |
 |      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
 |      | dev/test | путь к базе в бинарнике демона |  |
