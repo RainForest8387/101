@@ -175,7 +175,54 @@ diff -u docker-compare-dev.txt docker-compare-test.txt
 4. **Режим ОС и МКЦ** (`astra-modeswitch`, `max_ilev`).
 5. **Drop-in'ы systemd** с дополнительными флагами демона.
 
-**Опыт с `astra-sec-level` на dev**
+**Результат сравнения (начало diff)**
+
+`crm-tst-brkr01` это test (ошибки нет), `kfk-dev-al-qm01` это dev (ошибка есть):
+
+| Пакет | test | dev |
+|---|---|---|
+| `oval-db` | **1.2.2+ci2** | **0.0.2.astra1+ci3** |
+| `docker.io` | 25.0.5.astra2+**ci6** | 25.0.5.astra2+**ci5** |
+| compose | `docker-compose-v2` 29.1.2.astra1+ci5 | `docker-compose` 1.29.2-1astra.se1+ci1 |
+
+Кроме того, строка `Version: 5.0.2.astra1` (строка 40 среза) есть только на test. Нужно уточнить, к какому разделу среза она относится. Строки 49-211 отличаются целиком: это список OVAL-файлов и их хеши, что ожидаемо при разных версиях `oval-db`.
+
+Вывод:
+
+- **Основной кандидат — сильно устаревшая OVAL-база на dev** (`oval-db` 0.0.2 против 1.2.2). Демон проверяет образ по определениям из этого пакета. Старые определения, скорее всего, не выполняются на современных образах или устарели по формату, отсюда сплошные `error`.
+- **Второй кандидат — сборка `docker.io` на dev на одну ci-ревизию старше** (ci5 против ci6). В ci6 могли исправить обработку результата `error`. Поэтому обновлять лучше оба пакета, до версий как на test.
+- Compose на запуск контейнеров демоном не влияет, но его лучше привести к одной версии, чтобы окружения не расходились.
+- `astra-sec-level` отходит на второй план. Опыт с ним делать, только если обновление пакетов не поможет.
+
+**Обновление `oval-db` и `docker.io` на dev до версий test**
+
+Проверить, что нужные версии доступны в репозиториях dev:
+
+```bash
+apt update
+apt policy oval-db docker.io
+apt-cache show oval-db | grep -E '^(Version|Depends)'
+```
+
+Если `1.2.2+ci2` и `25.0.5.astra2+ci6` есть в списке кандидатов, обновить до них (в окно работ, так как перезапуск docker останавливает контейнеры):
+
+```bash
+sudo apt install oval-db=1.2.2+ci2 docker.io=25.0.5.astra2+ci6
+sudo systemctl restart docker
+dpkg -l oval-db docker.io | awk '/^ii/ {print $2, $3}'
+cid=$(docker create sha256:99307ab28a49) && docker start $cid && echo "OK: контейнер стартовал"
+docker rm -f $cid
+```
+
+Если в репозиториях dev этих версий нет, сравнить подключённые репозитории на обоих хостах. Скорее всего, test смотрит на более свежий репозиторий или на другое обновление Astra:
+
+```bash
+grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/
+```
+
+Порядок проверки: сначала обновить только `oval-db`, перезапустить docker и попробовать запуск. Так станет понятно, какой пакет виноват. Если не помогло, обновить `docker.io`.
+
+**Опыт с `astra-sec-level` на dev (если обновление пакетов не помогло)**
 
 Проверить, что проверка зависит от этого параметра. Делать в окно работ: перезапуск docker остановит контейнеры на dev.
 
@@ -224,7 +271,12 @@ RUN apt-get update && apt-get dist-upgrade -y && \
 
 **3. Обновить OVAL-базу на хосте**
 
-Если база устарела или повреждена (диагностика, шаг 6), обновить соответствующий пакет из репозитория Astra (`apt update && apt install --only-upgrade <пакет_с_oval>`) и перезапустить docker.
+Если база устарела или повреждена (диагностика, шаг 6), обновить пакет `oval-db` (и при необходимости `docker.io`) из репозитория Astra и перезапустить docker. Для dev это основной вариант: `oval-db` 0.0.2 против 1.2.2 на test (см. раздел «Сравнение dev и test»).
+
+```bash
+sudo apt update && sudo apt install --only-upgrade oval-db docker.io
+sudo systemctl restart docker
+```
 
 **4. Ослабить или отключить проверку в демоне (только по согласованию с ИБ)**
 
@@ -258,7 +310,9 @@ docker info >/dev/null && echo "docker поднялся"
 |      | 7   | запуск эталонного Astra-образа |  |
 |      | dev/test | `daemon.json` | dev: insecure-registries + log-opts; test: `astra-sec-level: 6`, `live-restore` |
 |      | dev/test | `openscap-cpe-oval.xml` | одинаковые по размеру и дате (102K, 26.01.2023), sha256 не сверен |
-|      | dev/test | diff срезов |  |
+|      | dev/test | diff срезов | `oval-db`: test 1.2.2+ci2, dev 0.0.2.astra1+ci3; `docker.io`: test ci6, dev ci5; compose: v2 29.1.2 / 1.29.2; `Version: 5.0.2.astra1` только на test (уточнить, откуда) |
+|      | dev | обновление `oval-db` |  |
+|      | dev | обновление `docker.io` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
 ### Итог
