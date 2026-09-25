@@ -190,37 +190,60 @@ diff -u docker-compare-dev.txt docker-compare-test.txt
 Вывод:
 
 - **Основной кандидат — сильно устаревшая OVAL-база на dev** (`oval-db` 0.0.2 против 1.2.2). Демон проверяет образ по определениям из этого пакета. Старые определения, скорее всего, не выполняются на современных образах или устарели по формату, отсюда сплошные `error`.
-- **Второй кандидат — сборка `docker.io` на dev на одну ci-ревизию старше** (ci5 против ci6). В ci6 могли исправить обработку результата `error`. Поэтому обновлять лучше оба пакета, до версий как на test.
+- **Второй кандидат — сборка `docker.io` на dev на одну ci-ревизию старше** (ci5 против ci6). В ci6 могли исправить обработку результата `error`. Сборки ci6 в репозиториях dev нет, поэтому сначала обновляется только `oval-db`.
 - Compose на запуск контейнеров демоном не влияет, но его лучше привести к одной версии, чтобы окружения не расходились.
 - `astra-sec-level` отходит на второй план. Опыт с ним делать, только если обновление пакетов не поможет.
 
-**Обновление `oval-db` и `docker.io` на dev до версий test**
+**Обновление `oval-db` на dev**
 
-Проверить, что нужные версии доступны в репозиториях dev:
+`apt policy` на dev:
+
+| Пакет | Установлен | Доступно в репозиториях dev |
+|---|---|---|
+| `oval-db` | 0.0.2.astra1+ci3 | **1.2.2+ci2** (repository-update, как на test), 1.1.0.astra1+ci8 (repository-base) |
+| `docker.io` | 25.0.5.astra2+ci5 | 29.5.1.astra1+ci1b1 (update), 29.1.2.astra1+ci5 (base), 20.10.2 (main). **Версии 25.0.5.astra2+ci6, как на test, нет** |
+
+Первая попытка `sudo apt install oval-db=1.2.2+ci2 docker.io=25.0.5.astra2+ci6` закончилась ошибкой `E: Версия «25.0.5.astra2+ci6» для «docker.io» не найдена`. apt отменяет всю команду, если не нашёл хотя бы одну версию, поэтому `oval-db` тоже не обновился.
+
+Поэтому обновляем **только `oval-db`**, а `docker.io` не трогаем.
+
+**Внимание:** кандидат для `docker.io` в репозиториях dev — 29.5.1, то есть смена мажорной версии. Команды `apt upgrade`, `apt full-upgrade` и `apt install --only-upgrade docker.io` без явной версии обновят docker до 29.x. Так делать нельзя без отдельной проверки.
+
+1. Посмотреть, что потянет за собой новая версия `oval-db` (пробный прогон, ничего не ставит):
 
 ```bash
-apt update
-apt policy oval-db docker.io
-apt-cache show oval-db | grep -E '^(Version|Depends)'
+apt-cache show oval-db=1.2.2+ci2 | grep -E '^(Version|Depends|Breaks|Conflicts)'
+apt-cache rdepends --installed oval-db
+sudo apt install -s oval-db=1.2.2+ci2 | grep -E '^(Inst|Remv)'
 ```
 
-Если `1.2.2+ci2` и `25.0.5.astra2+ci6` есть в списке кандидатов, обновить до них (в окно работ, так как перезапуск docker останавливает контейнеры):
+Если в выводе `-s` только `Inst oval-db`, можно ставить. Если там же `docker.io` (обновление до 29.x) или удаление пакетов, остановиться и разобраться с зависимостями.
+
+2. Обновить `oval-db` (в окно работ, перезапуск docker останавливает контейнеры):
 
 ```bash
-sudo apt install oval-db=1.2.2+ci2 docker.io=25.0.5.astra2+ci6
-sudo systemctl restart docker
+sudo apt install oval-db=1.2.2+ci2
 dpkg -l oval-db docker.io | awk '/^ii/ {print $2, $3}'
+sudo systemctl restart docker
 cid=$(docker create sha256:99307ab28a49) && docker start $cid && echo "OK: контейнер стартовал"
 docker rm -f $cid
 ```
 
-Если в репозиториях dev этих версий нет, сравнить подключённые репозитории на обоих хостах. Скорее всего, test смотрит на более свежий репозиторий или на другое обновление Astra:
+3. Если контейнер стартовал, причина была в устаревшей OVAL-базе. Закрепить `docker.io`, чтобы общий `apt upgrade` не поднял его до 29.x:
 
 ```bash
-grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/
+sudo apt-mark hold docker.io
 ```
 
-Порядок проверки: сначала обновить только `oval-db`, перезапустить docker и попробовать запуск. Так станет понятно, какой пакет виноват. Если не помогло, обновить `docker.io`.
+4. Если ошибка осталась, выяснить на **test**, откуда там `docker.io 25.0.5.astra2+ci6`:
+
+```bash
+apt policy docker.io
+grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/
+ls -la /var/cache/apt/archives/docker.io_*.deb 2>/dev/null
+```
+
+Если ci6 пришёл из другого репозитория, подключить его на dev. Если пакет ставили вручную из .deb, перенести этот .deb на dev и поставить через `sudo apt install ./docker.io_25.0.5.astra2+ci6_amd64.deb`. Обновление на 29.x рассматривать отдельно: это смена мажорной версии, и её нужно сначала проверить на test.
 
 **Опыт с `astra-sec-level` на dev (если обновление пакетов не помогло)**
 
@@ -271,10 +294,10 @@ RUN apt-get update && apt-get dist-upgrade -y && \
 
 **3. Обновить OVAL-базу на хосте**
 
-Если база устарела или повреждена (диагностика, шаг 6), обновить пакет `oval-db` (и при необходимости `docker.io`) из репозитория Astra и перезапустить docker. Для dev это основной вариант: `oval-db` 0.0.2 против 1.2.2 на test (см. раздел «Сравнение dev и test»).
+Если база устарела или повреждена (диагностика, шаг 6), обновить пакет `oval-db` из репозитория Astra и перезапустить docker. Для dev это основной вариант: `oval-db` 0.0.2 против 1.2.2 на test (см. раздел «Сравнение dev и test»).
 
 ```bash
-sudo apt update && sudo apt install --only-upgrade oval-db docker.io
+sudo apt update && sudo apt install --only-upgrade oval-db   # docker.io не трогать: кандидат 29.x
 sudo systemctl restart docker
 ```
 
@@ -311,8 +334,9 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev/test | `daemon.json` | dev: insecure-registries + log-opts; test: `astra-sec-level: 6`, `live-restore` |
 |      | dev/test | `openscap-cpe-oval.xml` | одинаковые по размеру и дате (102K, 26.01.2023), sha256 не сверен |
 |      | dev/test | diff срезов | `oval-db`: test 1.2.2+ci2, dev 0.0.2.astra1+ci3; `docker.io`: test ci6, dev ci5; compose: v2 29.1.2 / 1.29.2; `Version: 5.0.2.astra1` только на test (уточнить, откуда) |
-|      | dev | обновление `oval-db` |  |
-|      | dev | обновление `docker.io` (если нужно) |  |
+|      | dev | `apt install oval-db=1.2.2+ci2 docker.io=25.0.5.astra2+ci6` | не выполнено: версии docker.io ci6 нет в репозиториях dev, кандидат 29.5.1 |
+|      | dev | обновление только `oval-db` до 1.2.2+ci2 |  |
+|      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
 ### Итог
