@@ -245,6 +245,99 @@ ls -la /var/cache/apt/archives/docker.io_*.deb 2>/dev/null
 
 Если ci6 пришёл из другого репозитория, подключить его на dev. Если пакет ставили вручную из .deb, перенести этот .deb на dev и поставить через `sudo apt install ./docker.io_25.0.5.astra2+ci6_amd64.deb`. Обновление на 29.x рассматривать отдельно: это смена мажорной версии, и её нужно сначала проверить на test.
 
+### Новая ошибка на dev после обновления `oval-db`: permission denied в overlay2
+
+Ошибки OVAL больше нет. Теперь контейнер не создаётся: демон, работающий от root, не может писать в собственный каталог `/var/lib/docker/overlay2`.
+
+Сразу после старта демона (ScanService проверяет уже скачанные образы):
+
+```
+dockerd_audit: ScanService: ... ScanService.DirectoryProvider: failed to create container with image 'sha256:99307ab28a49...':
+  open /var/lib/docker/overlay2/0f7216ee...-init/merged/etc/resolv.conf: permission denied
+dockerd_audit: ScanService: ... DirectoryProvider: empty container handler
+dockerd_audit: ScanService: ... failed to create container with image 'sha256:ffb6864bc6f8...':
+  open /var/lib/docker/overlay2/6eb349d9...-init/merged/etc/hosts: permission denied
+```
+
+При `docker create` от пользователя `adm_soloduhin`:
+
+```
+dockerd.audit|1021|adm_soloduhin|...|container.create|failed|id=N/A|mkdir /var/lib/docker/overlay2/33c8b42c...-init/merged/dev/shm: permission denied
+dockerd: level=error msg="Handler for POST /v1.44/containers/create returned error: mkdir .../-init/merged/dev/pts: permission denied"
+```
+
+Что из этого следует:
+
+- **Сама проверка по OVAL теперь проходит дальше.** Ошибка возникает раньше, при подготовке init-слоя контейнера (`-init/merged`: `/etc/hosts`, `/etc/resolv.conf`, `/dev/shm`, `/dev/pts`). Этот слой создаётся заново для каждого контейнера.
+- **Отказ получает сам демон, а не только пользователь.** ScanService работает внутри dockerd сразу после старта, без участия пользователя, и тоже получает `permission denied`. Значит, дело не в правах пользователя на сокет и не в группе `docker`.
+- **root получает `permission denied`.** Обычные права Unix root'у так не отказывают. На Astra Linux 1.7 такой отказ обычно даёт мандатная защита: МКЦ (контроль целостности) или МРД (PARSEC). Уровень целостности процесса dockerd ниже метки каталогов в `/var/lib/docker`, или метки каталогов не совпадают с тем, что ожидает демон.
+- Раньше контейнер на dev создавался (доходил до проверки OVAL и падал на ней). Значит, между двумя запусками что-то поменялось. Кандидаты:
+  1. `daemon.json` на dev (например, уже добавлен `astra-sec-level: 6` для опыта ниже);
+  2. пакеты, которые поставились вместе с `oval-db` (зависимости);
+  3. уровень целостности, с которым systemd запускает dockerd после перезапуска;
+  4. метки на `/var/lib/docker`.
+
+**Диагностика**
+
+1. Что изменилось: конфиг и установленные пакеты.
+
+```bash
+sudo cat /etc/docker/daemon.json
+grep -E ' (install|upgrade|remove) ' /var/log/dpkg.log | tail -30
+dpkg -l oval-db docker.io containerd runc | awk '/^ii/ {print $2, $3}'
+```
+
+2. Режим ОС и МКЦ (сравнить с test):
+
+```bash
+astra-modeswitch get
+astra-mic-control status 2>/dev/null
+cat /sys/module/parsec/parameters/max_ilev 2>/dev/null
+```
+
+3. Мандатные метки процесса dockerd и каталогов docker (сравнить с test):
+
+```bash
+PID=$(systemctl show -p MainPID --value docker)
+sudo pdp-ps -p $PID 2>/dev/null || sudo cat /proc/$PID/attr/current 2>/dev/null
+sudo pdp-ls -Md /var/lib/docker /var/lib/docker/overlay2
+sudo pdp-ls -M /var/lib/docker/overlay2 | head -20
+sudo getfattr -d -m - /var/lib/docker/overlay2 2>/dev/null
+```
+
+4. Метка текущей сессии пользователя (для `docker create` от `adm_soloduhin`):
+
+```bash
+pdp-id
+```
+
+5. Отказы в журнале ядра и аудите PARSEC в момент `docker create`:
+
+```bash
+sudo dmesg -T | grep -iE 'parsec|denied|ilev|mic' | tail -30
+sudo journalctl -k --since "10 min ago" | grep -iE 'parsec|denied' | tail -30
+```
+
+6. Обычные права и ФС (для исключения причины):
+
+```bash
+sudo ls -ld /var/lib/docker /var/lib/docker/overlay2
+findmnt -T /var/lib/docker
+df -h /var/lib/docker; df -i /var/lib/docker
+```
+
+**Варианты решения (выбрать по результатам диагностики)**
+
+- **В `daemon.json` на dev появился `astra-sec-level`**, а режим МКЦ на dev отличается от test: убрать параметр (вернуть конфиг из `.bak`) и перезапустить docker. Или привести режим ОС и МКЦ на dev к режиму test.
+- **Метки на `/var/lib/docker` не совпадают с test:** выровнять их по образцу test через `pdpl-file`, только по согласованию с ИБ. Конкретные значения меток брать с test (шаг 3), не угадывать.
+- **dockerd запускается с более низким уровнем целостности, чем на test:** сравнить `systemctl cat docker` и drop-in'ы в `/etc/systemd/system/docker.service.d/` на обоих хостах.
+- **Проблема появилась именно из-за нового `oval-db` или его зависимостей:** откатить. Версии 0.0.2.astra1+ci3 в репозиториях нет, поэтому смотреть старый .deb в кэше apt:
+
+```bash
+ls /var/cache/apt/archives/oval-db_*
+sudo apt install /var/cache/apt/archives/oval-db_0.0.2.astra1+ci3_*.deb
+```
+
 **Опыт с `astra-sec-level` на dev (если обновление пакетов не помогло)**
 
 Проверить, что проверка зависит от этого параметра. Делать в окно работ: перезапуск docker остановит контейнеры на dev.
@@ -335,7 +428,10 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev/test | `openscap-cpe-oval.xml` | одинаковые по размеру и дате (102K, 26.01.2023), sha256 не сверен |
 |      | dev/test | diff срезов | `oval-db`: test 1.2.2+ci2, dev 0.0.2.astra1+ci3; `docker.io`: test ci6, dev ci5; compose: v2 29.1.2 / 1.29.2; `Version: 5.0.2.astra1` только на test (уточнить, откуда) |
 |      | dev | `apt install oval-db=1.2.2+ci2 docker.io=25.0.5.astra2+ci6` | не выполнено: версии docker.io ci6 нет в репозиториях dev, кандидат 29.5.1 |
-|      | dev | обновление только `oval-db` до 1.2.2+ci2 |  |
+| 25.09.2026 | dev | обновление только `oval-db` до 1.2.2+ci2 | ошибка OVAL ушла; новая ошибка: `permission denied` при создании init-слоя в `/var/lib/docker/overlay2` (ScanService при старте и `docker create`) |
+|      | dev | что изменилось: `daemon.json`, `dpkg.log` |  |
+|      | dev/test | МКЦ: `astra-modeswitch`, `astra-mic-control`, метки dockerd и `/var/lib/docker` |  |
+|      | dev | `dmesg` / `journalctl -k` в момент `docker create` |  |
 |      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
