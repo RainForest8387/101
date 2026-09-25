@@ -377,6 +377,31 @@ strings "$DAEMON_BIN" | grep -iE '/oval|db\.xml' | sort -u
 
 Сравнить с test: где там лежит база, есть ли `/usr/share/oval/db.xml` и какой путь зашит в `docker.io` ci6.
 
+**Результат на dev: `/usr/share/oval/` после установки `oval-db` 1.2.2+ci2**
+
+```
+drwxrwxr-x 7 root root 4,0K сен 25 22:19 .
+drwxr-xr-x 2 root root 4,0K сен 25 22:19 conf
+drwxrwxr-x 3 root root 4,0K сен 25 22:19 db
+drwxr-xr-x 2 root root 4,0K сен 25 22:19 history
+drwxr-xr-x 3 root root 4,0K сен 25 22:19 localization
+drwxr-xr-x 2 root root 4,0K сен 25 22:19 scan-whitelist
+```
+
+- Файла `db.xml` в корне `/usr/share/oval/` нет. Вместо него **новая структура каталогов**: база в `db/`, отдельно `conf/`, `history/`, `localization/`, `scan-whitelist/`. Все созданы в 22:19, это момент установки пакета.
+- Это подтверждает гипотезу: `oval-db` 1.2.x сменил формат и расположение базы, а `docker.io` ci5 ищет старый `/usr/share/oval/db.xml`. Пара ci5 + 1.2.2 несовместима. Сканер ci6 (test), видимо, понимает новую структуру.
+- **`scan-whitelist/`** похож на штатный механизм исключений для сканера: его можно было бы использовать вместо отключения проверки. Посмотреть содержимое и формат на test и в документации Astra.
+
+Следующий шаг: посмотреть содержимое каталогов на dev и test:
+
+```bash
+sudo ls -laR /usr/share/oval/db /usr/share/oval/conf /usr/share/oval/scan-whitelist
+sudo head -50 /usr/share/oval/conf/* 2>/dev/null
+ls -la /usr/share/oval/db.xml 2>/dev/null || echo "db.xml нет"
+```
+
+На test дополнительно проверить, есть ли там `/usr/share/oval/db.xml` (если есть, возможно, это ссылка) и что в `conf/`.
+
 **Варианты решения**
 
 1. **Привести пару пакетов на dev к паре на test** (`oval-db` 1.2.2+ci2 + `docker.io` 25.0.5.astra2+ci6). Это правильный путь. ci6 в репозиториях dev нет, поэтому сначала выяснить на test, откуда он взялся (см. «Обновление `oval-db` на dev», шаг 4), и перенести пакет или репозиторий.
@@ -495,7 +520,8 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev/test | МКЦ: `astra-modeswitch`, `astra-mic-control`, метки dockerd и `/var/lib/docker` |  |
 |      | dev | `dmesg` / `journalctl -k` в момент `docker create` |  |
 | 25.09.2026 | dev | удалены все контейнеры и образы, `docker load < dockge-latest.tar.gz` | `database not exists in /usr/share/oval/db.xml` |
-|      | dev/test | `dpkg -L oval-db`, путь к базе в бинарнике демона |  |
+| 25.09.2026 | dev | `ls -la /usr/share/oval/` | `db.xml` нет; новая структура: `conf/`, `db/`, `history/`, `localization/`, `scan-whitelist/` (создано 22:19 при установке `oval-db` 1.2.2) |
+|      | dev/test | содержимое `db/`, `conf/`, `scan-whitelist/`; путь к базе в бинарнике демона |  |
 |      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
