@@ -402,6 +402,63 @@ ls -la /usr/share/oval/db.xml 2>/dev/null || echo "db.xml нет"
 
 На test дополнительно проверить, есть ли там `/usr/share/oval/db.xml` (если есть, возможно, это ссылка) и что в `conf/`.
 
+**Результат на dev: содержимое `/usr/share/oval/`**
+
+Подтверждено, что вывод с dev. Даты внутри каталогов (31 авг, 4 авг, 11 сен) — это даты из самого пакета: dpkg при распаковке сохраняет время изменения файлов из архива. Поэтому по датам нельзя судить, когда пакет ставился и правили ли файлы. Почему `ls -la /usr/share/oval/` ранее показал 25 сен 22:19 у тех же каталогов, пока не ясно, на вывод это не влияет.
+
+```
+/usr/share/oval/conf:
+-rw-r--r-- 1 root root   353 сен 11 15:57 docker.json
+-rw-r--r-- 1 root root   505 авг  4 13:59 podman.json
+
+/usr/share/oval/db/astra/1.7_x86-64:
+-rwxrwxr-x 1 root root   579976 авг  4 13:59 CriticalSeverity.xml
+-rwxrwxr-x 1 root root 41320543 авг  4 13:59 HighSeverity.xml
+-rwxrwxr-x 1 root root  3140639 авг  4 13:59 LowSeverity.xml
+-rwxrwxr-x 1 root root     1041 авг  4 13:59 manifest.json
+-rwxrwxr-x 1 root root 55403250 авг  4 13:59 MediumSeverity.xml
+-rwxrwxr-x 1 root root  8321047 авг  4 13:59 NoneSeverity.xml
+
+/usr/share/oval/db/astra/1.8_x86-64:
+  (тот же набор файлов, меньшего размера)
+
+/usr/share/oval/scan-whitelist:
+-rw-r--r-- 1 root root 36864 авг 31 11:51 scan-whitelist.db
+```
+
+Наблюдения:
+
+- **Формат базы в 1.2.x:** база разбита по версии Astra (`1.7_x86-64`, `1.8_x86-64`) и по критичности (`Critical/High/Medium/Low/NoneSeverity.xml`), плюс `manifest.json`. Единого `db.xml` больше нет, поэтому `docker.io` ci5 со старым путём `/usr/share/oval/db.xml` с этой базой работать не может.
+- **`conf/docker.json` (11 сен 15:57)** — настройки сканера для docker. Дата, скорее всего, из пакета, а не след ручной правки (проверить через `dpkg --verify oval-db`). Нужно сравнить содержимое с test: если на test файл отличается (порог критичности, режим «только предупреждать» и т.п.), **это может быть причиной, почему на test ошибки нет**.
+- **`scan-whitelist/scan-whitelist.db`** (36864 байт, кратно странице SQLite) — вероятно, SQLite-база исключений сканера. Если на test в ней есть записи, это тоже объясняет отсутствие ошибки.
+
+Следующий шаг (на обоих хостах):
+
+```bash
+sudo cat /usr/share/oval/conf/docker.json
+sudo cat /usr/share/oval/db/astra/1.7_x86-64/manifest.json
+dpkg -S /usr/share/oval/conf/docker.json
+sudo dpkg --verify oval-db             # покажет файлы пакета, изменённые вручную (5 = изменён хеш)
+file /usr/share/oval/scan-whitelist/scan-whitelist.db
+sudo sqlite3 -readonly /usr/share/oval/scan-whitelist/scan-whitelist.db '.tables'
+sudo sqlite3 -readonly /usr/share/oval/scan-whitelist/scan-whitelist.db '.schema'
+```
+
+Если `docker.json` или `scan-whitelist.db` на test отличаются от dev, записать сюда, что именно отличается и кем согласовано. Это будет готовое решение для dev вместе с согласованной парой пакетов.
+
+**Результат на test: `/usr/share/oval/` совпадает с dev полностью** (те же файлы, размеры и даты, включая `conf/docker.json` и `scan-whitelist.db`). `db.xml` нет и на test.
+
+Вывод:
+
+- **OVAL-база и её настройки на обоих хостах одинаковые.** Остаётся одно отличие — сборка `docker.io`: на test **ci6** работает с новой структурой `/usr/share/oval/db/astra/<версия>/*Severity.xml`, на dev **ci5** ищет старый `/usr/share/oval/db.xml` и не находит его.
+- **Решение для dev: поставить `docker.io` 25.0.5.astra2+ci6**, как на test (см. «Обновление `oval-db` на dev», шаг 4: выяснить на test, откуда пакет). Ссылка `db.xml` не поможет: формат базы другой.
+- Совпадение по размеру и дате ещё не доказывает одинаковое содержимое. Для контроля сверить хеши:
+
+```bash
+sudo find /usr/share/oval -type f -exec sha256sum {} + | sort -k2 > ~/oval-$(hostname -s).sha256
+diff ~/oval-<dev>.sha256 ~/oval-<test>.sha256
+```
+
 **Варианты решения**
 
 1. **Привести пару пакетов на dev к паре на test** (`oval-db` 1.2.2+ci2 + `docker.io` 25.0.5.astra2+ci6). Это правильный путь. ci6 в репозиториях dev нет, поэтому сначала выяснить на test, откуда он взялся (см. «Обновление `oval-db` на dev», шаг 4), и перенести пакет или репозиторий.
@@ -521,7 +578,11 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev | `dmesg` / `journalctl -k` в момент `docker create` |  |
 | 25.09.2026 | dev | удалены все контейнеры и образы, `docker load < dockge-latest.tar.gz` | `database not exists in /usr/share/oval/db.xml` |
 | 25.09.2026 | dev | `ls -la /usr/share/oval/` | `db.xml` нет; новая структура: `conf/`, `db/`, `history/`, `localization/`, `scan-whitelist/` (создано 22:19 при установке `oval-db` 1.2.2) |
-|      | dev/test | содержимое `db/`, `conf/`, `scan-whitelist/`; путь к базе в бинарнике демона |  |
+| 25.09.2026 | dev | `ls -laR /usr/share/oval/{db,conf,scan-whitelist}` | база по версиям Astra и критичности (`*Severity.xml` + `manifest.json`), `conf/docker.json`, `conf/podman.json`, `scan-whitelist.db` (SQLite?); `db.xml` нет |
+| 25.09.2026 | test | то же `ls -laR /usr/share/oval/...` | полностью совпадает с dev: те же файлы, размеры и даты, `db.xml` нет. Разница между хостами — только `docker.io` ci5 (dev) / ci6 (test) |
+|      | dev/test | `sha256sum` по `/usr/share/oval` |  |
+|      | dev/test | `conf/docker.json`, `manifest.json`, `dpkg --verify oval-db`, таблицы `scan-whitelist.db` |  |
+|      | dev/test | путь к базе в бинарнике демона |  |
 |      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
