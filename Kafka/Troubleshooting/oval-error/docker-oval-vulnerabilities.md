@@ -259,10 +259,10 @@ dockerd_audit: ScanService: ... failed to create container with image 'sha256:ff
   open /var/lib/docker/overlay2/6eb349d9...-init/merged/etc/hosts: permission denied
 ```
 
-При `docker create` от пользователя `adm_soloduhin`:
+При `docker create` от пользователя:
 
 ```
-dockerd.audit|1021|adm_soloduhin|...|container.create|failed|id=N/A|mkdir /var/lib/docker/overlay2/33c8b42c...-init/merged/dev/shm: permission denied
+dockerd.audit|1021|<user>|...|container.create|failed|id=N/A|mkdir /var/lib/docker/overlay2/33c8b42c...-init/merged/dev/shm: permission denied
 dockerd: level=error msg="Handler for POST /v1.44/containers/create returned error: mkdir .../-init/merged/dev/pts: permission denied"
 ```
 
@@ -305,7 +305,7 @@ sudo pdp-ls -M /var/lib/docker/overlay2 | head -20
 sudo getfattr -d -m - /var/lib/docker/overlay2 2>/dev/null
 ```
 
-4. Метка текущей сессии пользователя (для `docker create` от `adm_soloduhin`):
+4. Метка текущей сессии пользователя (пользователя, от которого запускается `docker create`):
 
 ```bash
 pdp-id
@@ -337,6 +337,68 @@ df -h /var/lib/docker; df -i /var/lib/docker
 ls /var/cache/apt/archives/oval-db_*
 sudo apt install /var/cache/apt/archives/oval-db_0.0.2.astra1+ci3_*.deb
 ```
+
+### Ошибка на dev при `docker load`: `database not exists in /usr/share/oval/db.xml`
+
+На dev удалены все контейнеры и образы, образ загружается заново:
+
+```
+$ docker load < ~/08.containers/dockge-latest.tar.gz
+1287fbecdfcc: Loading layer [=================================================> ]  76.32MB/77.84MB
+database not exists in /usr/share/oval/db.xml
+```
+
+Что из этого следует:
+
+- Проверка образа запускается уже на `docker load`, и демон ищет OVAL-базу по жёсткому пути `/usr/share/oval/db.xml`. **Файла там нет.**
+- Путь к базе задан в сборке `docker.io` 25.0.5.astra2+**ci5**. Скорее всего, новый `oval-db` 1.2.2+ci2 кладёт базу в другое место или под другим именем (сжатую, в `/var/lib/...` и т.п.). Её могут также ставить отдельным шагом (postinst, служба обновления). На test та же версия `oval-db` работает в паре с `docker.io` **ci6**. Значит, пакеты на dev сейчас **несовместимы**: новый `oval-db` при старом `docker.io`.
+- Эта же несовместимость может объяснять и `permission denied` из предыдущего раздела: сканер не может нормально подготовить проверку.
+
+**Диагностика: куда `oval-db` кладёт базу и где её ищет docker (на dev и test)**
+
+```bash
+# что ставит пакет
+dpkg -L oval-db
+ls -la /usr/share/oval/ 2>/dev/null
+dpkg -L oval-db | grep -iE '\.(xml|gz|bz2|xz|zst)$' | xargs -r ls -la
+
+# скрипты пакета: не генерируется ли db.xml при установке
+ls /var/lib/dpkg/info/oval-db.*
+cat /var/lib/dpkg/info/oval-db.postinst 2>/dev/null
+
+# службы и таймеры обновления базы
+systemctl list-unit-files | grep -iE 'oval'
+dpkg -L oval-db | grep -E 'systemd|cron'
+
+# какой путь к базе зашит в демоне
+DAEMON_BIN=$(readlink -f /proc/$(systemctl show -p MainPID --value docker)/exe)
+strings "$DAEMON_BIN" | grep -iE '/oval|db\.xml' | sort -u
+```
+
+Сравнить с test: где там лежит база, есть ли `/usr/share/oval/db.xml` и какой путь зашит в `docker.io` ci6.
+
+**Варианты решения**
+
+1. **Привести пару пакетов на dev к паре на test** (`oval-db` 1.2.2+ci2 + `docker.io` 25.0.5.astra2+ci6). Это правильный путь. ci6 в репозиториях dev нет, поэтому сначала выяснить на test, откуда он взялся (см. «Обновление `oval-db` на dev», шаг 4), и перенести пакет или репозиторий.
+2. **Откатить `oval-db` на dev до 0.0.2.astra1+ci3.** Вернётся исходная ошибка OVAL, но docker снова будет работать в согласованной паре с ci5. Старая версия есть только в кэше apt, если он не чистился:
+
+   ```bash
+   ls /var/cache/apt/archives/oval-db_*
+   sudo apt install /var/cache/apt/archives/oval-db_0.0.2.astra1+ci3_*.deb
+   sudo systemctl restart docker
+   ```
+
+   Если .deb в кэше нет, взять его с другого хоста с этой версией (`dpkg-repack oval-db` на нём) или из архива репозитория Astra.
+3. **Промежуточный обходной путь, только для проверки гипотезы.** Если новый `oval-db` ставит базу в другое место и формат совместим, можно сделать ссылку:
+
+   ```bash
+   sudo mkdir -p /usr/share/oval
+   sudo ln -s <путь_к_базе_из_dpkg -L> /usr/share/oval/db.xml
+   sudo systemctl restart docker
+   ```
+
+   Это не решение: dpkg про эту ссылку не знает, а формат базы 1.2.2 может не подходить сканеру ci5. Для dev допустимо, чтобы подтвердить причину, дальше всё равно вариант 1.
+4. **Обновить `docker.io` на dev до 29.x из репозитория** (там `oval-db` 1.2.2 и docker, вероятно, согласованы). Это смена мажорной версии, поэтому сначала проверить на test и согласовать.
 
 **Опыт с `astra-sec-level` на dev (если обновление пакетов не помогло)**
 
@@ -432,6 +494,8 @@ docker info >/dev/null && echo "docker поднялся"
 |      | dev | что изменилось: `daemon.json`, `dpkg.log` |  |
 |      | dev/test | МКЦ: `astra-modeswitch`, `astra-mic-control`, метки dockerd и `/var/lib/docker` |  |
 |      | dev | `dmesg` / `journalctl -k` в момент `docker create` |  |
+| 25.09.2026 | dev | удалены все контейнеры и образы, `docker load < dockge-latest.tar.gz` | `database not exists in /usr/share/oval/db.xml` |
+|      | dev/test | `dpkg -L oval-db`, путь к базе в бинарнике демона |  |
 |      | test | откуда `docker.io 25.0.5.astra2+ci6` (если нужно) |  |
 |      | dev | опыт с `astra-sec-level: 6` |  |
 
