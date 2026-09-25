@@ -21,7 +21,7 @@ Docker из репозитория Astra Linux (сертифицированна
 
 Косвенно это подтверждает и сам список. Вряд ли в одном образе (например, с Kafka) есть cgal, firefox, thunderbird, sox, ruby-rack, redis и ядро linux одновременно. Скорее всего, это не найденные пакеты, а определения, которые не смогли выполниться.
 
-> Гипотезу нужно подтвердить диагностикой ниже. Названия опций демона и путей к OVAL-базе зависят от версии Astra (1.7.x / 1.8.x) и пакета docker. Сверяйтесь с `man dockerd` на своём хосте и с документацией Astra (wiki.astralinux.ru).
+> Гипотезу нужно подтвердить диагностикой ниже. Названия опций демона и путей к OVAL-базе зависят от версии Astra (1.7.x / 1.8.x) и пакета docker. Сверяйтесь с `man docker` на своём хосте и с документацией Astra (wiki.astralinux.ru).
 
 ### Диагностика
 
@@ -84,14 +84,18 @@ journalctl -u docker --since "1 hour ago" | grep -iE 'oval|vulnerab|scan'
 
 **5. Найти настройки проверки в своей сборке docker**
 
-Опции у разных сборок называются по-разному, поэтому ищем прямо в бинарнике и документации:
+Опции у разных сборок называются по-разному, поэтому ищем в конфиге, документации и бинарнике. Сообщение `Error response from daemon` приходит от демона, а не от клиента `docker`, поэтому бинарник демона находим через systemd:
 
 ```bash
-dockerd --help 2>&1 | grep -iE 'oval|vuln|scan|astra'
-man dockerd | grep -iE -A3 'oval|vuln'
-strings $(command -v dockerd) | grep -iE 'oval|vulnerab' | sort -u | head -50
 cat /etc/docker/daemon.json
-systemctl cat docker | grep -i ExecStart
+systemctl cat docker | grep -iE 'ExecStart|Environment'
+docker info 2>&1 | grep -iE 'oval|vuln|scan|security|astra'
+man docker 2>/dev/null | grep -iE -A3 'oval|vuln'
+
+# бинарник, который реально запущен как демон
+DAEMON_BIN=$(readlink -f /proc/$(systemctl show -p MainPID --value docker)/exe)
+echo $DAEMON_BIN
+strings "$DAEMON_BIN" | grep -iE 'oval|vulnerab' | sort -u | head -50
 ```
 
 Из вывода `strings` обычно видно имя ключа `daemon.json` и путь к OVAL-файлу.
@@ -115,6 +119,86 @@ docker run --rm registry.astralinux.ru/library/astra/ubi18:latest cat /etc/astra
 ```
 
 Если Astra-образ запускается, проверка в целом работает и проблема в конкретном образе. Если тоже падает с `error`, проблема в базе или конфигурации демона на хосте.
+
+### Сравнение dev (ошибка есть) и test (ошибки нет)
+
+Оба хоста на Astra Linux.
+
+| | dev | test |
+|---|---|---|
+| Ошибка OVAL при запуске | да | нет |
+| `/etc/docker/daemon.json` | `insecure-registries: [proxy-nexus.ru, nexus.ru]`, `log-opts` (max-file 3, max-size 100m) | `astra-sec-level: 6`, `live-restore: true` |
+| `/usr/share/openscap/cpe/openscap-cpe-oval.xml` | 102K, 26 янв 2023 | 102K, 26 янв 2023 |
+
+Наблюдения:
+
+- **`openscap-cpe-oval.xml` не причина**, если файлы действительно одинаковые (проверить `sha256sum`, а не только размер и дату). Это словарь CPE: по нему OpenSCAP определяет платформу. Самих определений уязвимостей Astra (`oval:astra:def:...`) в нём нет, они лежат в другом файле. Его нужно найти (ниже) и сравнить.
+- **`astra-sec-level` есть только на test.** Этот параметр Astra-сборки docker задаёт уровень целостности (МКЦ) для контейнеров. Гипотеза: от него или от связанного режима зависит, как демон проверяет образы. Не подтверждено, проверить опытом (ниже).
+- **`insecure-registries` есть только на dev.** Образ на dev мог прийти через `proxy-nexus.ru` и отличаться от образа на test. Проверить, что digest совпадает.
+- `live-restore` и `log-opts` на проверку образов не влияют.
+
+**Собрать одинаковый срез с обоих хостов и сравнить**
+
+Запустить на dev и на test:
+
+```bash
+H=$(hostname -s); OUT=~/docker-compare-$H.txt
+{
+  echo "== astra";      cat /etc/astra_version; astra-modeswitch get 2>/dev/null
+  echo "== mic";        cat /sys/module/parsec/parameters/max_ilev 2>/dev/null; astra-mic-control status 2>/dev/null
+  echo "== docker";     docker version --format '{{.Client.Version}} / {{.Server.Version}}'
+  echo "== packages";   dpkg -l | awk '/^ii/ && $2 ~ /docker|containerd|runc|openscap|oval|astra-sec|parsec/ {print $2, $3}'
+  echo "== daemon.json"; cat /etc/docker/daemon.json
+  echo "== unit";       systemctl cat docker | grep -iE 'ExecStart|Environment'
+  echo "== drop-ins";   ls -la /etc/systemd/system/docker.service.d/ 2>/dev/null
+  echo "== info";       docker info 2>/dev/null | grep -iE 'security|astra|storage driver|cgroup'
+  echo "== oval files"
+  find / -xdev \( -iname '*oval*' -o -iname '*astra*bulletin*' \) -type f 2>/dev/null \
+    | xargs -r ls -la --time-style=long-iso
+  find / -xdev -iname '*oval*' -type f 2>/dev/null | xargs -r sha256sum
+  echo "== image";      docker image ls --digests --no-trunc | grep -E '99307ab28a49|IMAGE'
+} > "$OUT" 2>&1
+echo "$OUT"
+```
+
+Затем свести файлы на одну машину и сравнить:
+
+```bash
+diff -u docker-compare-dev.txt docker-compare-test.txt
+```
+
+На что смотреть в diff:
+
+1. **Версия пакета docker** (`docker.io` или аналог). Если на dev сборка новее, проверку по OVAL могли добавить или включить по умолчанию именно в ней.
+2. **Файлы OVAL-базы уязвимостей.** Разные даты или хеши, либо базы нет на test.
+3. **Digest образа.** Если отличается, на хостах разные образы и сравнение некорректно.
+4. **Режим ОС и МКЦ** (`astra-modeswitch`, `max_ilev`).
+5. **Drop-in'ы systemd** с дополнительными флагами демона.
+
+**Опыт с `astra-sec-level` на dev**
+
+Проверить, что проверка зависит от этого параметра. Делать в окно работ: перезапуск docker остановит контейнеры на dev.
+
+```bash
+sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak.$(date +%F)
+sudo tee /etc/docker/daemon.json >/dev/null <<'EOF'
+{
+  "insecure-registries": ["proxy-nexus.ru", "nexus.ru"],
+  "log-opts": { "max-file": "3", "max-size": "100m" },
+  "astra-sec-level": 6
+}
+EOF
+python3 -m json.tool /etc/docker/daemon.json >/dev/null && sudo systemctl restart docker
+docker info >/dev/null
+cid=$(docker create sha256:99307ab28a49) && docker start $cid && echo "OK: контейнер стартовал"
+docker rm -f $cid
+journalctl -u docker --since "5 min ago" | grep -iE 'oval|vulnerab|sec-level|error'
+```
+
+- Контейнер запустился: причина в отличии конфигурации. Решение привести dev к конфигурации test и согласовать это с ИБ.
+- Ошибка осталась: откатить (`sudo cp /etc/docker/daemon.json.bak.<дата> /etc/docker/daemon.json && sudo systemctl restart docker`) и искать отличие в версиях пакетов и OVAL-базе по diff.
+
+> `astra-sec-level` работает только если на хосте включён соответствующий режим защиты (МКЦ). Если демон не стартует с этим параметром, смотреть `journalctl -u docker` и сравнивать режим ОС с test.
 
 ### Варианты решения
 
@@ -149,8 +233,9 @@ RUN apt-get update && apt-get dist-upgrade -y && \
 ```bash
 sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak.$(date +%F)
 sudo vi /etc/docker/daemon.json       # ключ из шага 5
-sudo dockerd --validate --config-file /etc/docker/daemon.json   # если поддерживается
+python3 -m json.tool /etc/docker/daemon.json >/dev/null && echo "JSON ok"
 sudo systemctl restart docker
+docker info >/dev/null && echo "docker поднялся"
 ```
 
 **Риски:** отключение проверки нарушает сертифицированную конфигурацию (ФСТЭК) и действует на все образы на хосте, а не только на этот. Решение фиксировать документально. Перезапуск docker останавливает все контейнеры без `--restart`/`live-restore`, поэтому делать в окно работ.
@@ -168,9 +253,13 @@ sudo systemctl restart docker
 |      | 1   | `cat /etc/astra_version`, `docker version` |  |
 |      | 2   | базовый дистрибутив образа |  |
 |      | 3   | есть ли пакеты из списка |  |
-|      | 5   | имя опции проверки в dockerd |  |
+|      | 5   | имя опции проверки в daemon.json |  |
 |      | 6   | дата/версия OVAL-базы |  |
 |      | 7   | запуск эталонного Astra-образа |  |
+|      | dev/test | `daemon.json` | dev: insecure-registries + log-opts; test: `astra-sec-level: 6`, `live-restore` |
+|      | dev/test | `openscap-cpe-oval.xml` | одинаковые по размеру и дате (102K, 26.01.2023), sha256 не сверен |
+|      | dev/test | diff срезов |  |
+|      | dev | опыт с `astra-sec-level: 6` |  |
 
 ### Итог
 
